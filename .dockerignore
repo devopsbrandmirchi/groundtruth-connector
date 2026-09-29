@@ -1,0 +1,13 @@
+.git/
+.cursor/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+venv/
+myenv/
+service-role.key
+*.secret
+secrets/
+_test_*.py

@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Get Meta User Token — MCP Connector</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1117;
+      --panel: #171a22;
+      --border: #2a2f3a;
+      --text: #e8eaed;
+      --muted: #9aa0a6;
+      --accent: #6ea8fe;
+      --warn: #fbbf24;
+      --ok: #81c995;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    .wrap { max-width: 820px; margin: 0 auto; padding: 28px 20px 48px; }
+    h1 { margin: 0 0 8px; font-size: 1.6rem; }
+    .sub { color: var(--muted); margin-bottom: 24px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px 20px;
+      margin-bottom: 16px;
+    }
+    h2 { margin: 0 0 10px; font-size: 1.05rem; }
+    ol, ul { margin: 0; padding-left: 20px; }
+    li { margin: 8px 0; }
+    a { color: var(--accent); }
+    .warn { color: var(--warn); }
+    .ok { color: var(--ok); }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 6px; }
+    input, textarea {
+      width: 100%;
+      font: inherit;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    textarea { min-height: 88px; resize: vertical; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+    button {
+      font: inherit;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 16px;
+      cursor: pointer;
+      font-weight: 600;
+      background: var(--accent);
+      color: #0b1220;
+    }
+    button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
+    .token-box { margin-top: 12px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Get Meta User Token</h1>
+    <p class="sub">You need a <strong>User Token</strong> (starts with <code>EAA…</code>), not an App Token (<code>app_id|secret</code>).</p>
+
+    <div class="card">
+      <h2>Why Graph API Explorer fails</h2>
+      <ul>
+        <li><span class="warn">User or Page = App Token</span> → cannot read ad accounts</li>
+        <li>Request path is empty (<code>/v20.0/</code>) → code 100 error</li>
+        <li>Token must be generated for app <strong id="appLabel">MCP_APP</strong> with <code>ads_read</code></li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>Step 1 — Add yourself to the Meta app</h2>
+      <ol>
+        <li>Open <a id="rolesLink" href="#" target="_blank" rel="noopener">Meta App Roles</a></li>
+        <li>Add your Facebook account as <strong>Administrator</strong> or <strong>Developer</strong></li>
+        <li>In the app dashboard, add product <strong>Facebook Login</strong> if missing</li>
+        <li>Ensure app mode is <strong>Development</strong> (fine for testing)</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h2>Step 2 — Generate token (easiest)</h2>
+      <label for="appId">GROUND_TRUTH_APP_ID from .env</label>
+      <input id="appId" type="text" placeholder="2095507501333711" />
+
+      <div class="row">
+        <button type="button" id="openOAuth">Open Facebook Login</button>
+        <button type="button" class="secondary" id="openExplorer">Open Graph API Explorer</button>
+      </div>
+
+      <p style="margin:14px 0 0;font-size:0.92rem;color:var(--muted)">
+        After login, copy the token from the redirect URL (<code>#access_token=EAA…</code>) or from Graph API Explorer.
+      </p>
+
+      <div class="token-box">
+        <label for="tokenOut">Paste token here → copy into .env as GROUND_TRUTH_ACCESS_TOKEN</label>
+        <textarea id="tokenOut" placeholder="EAAxxxxxxxx…"></textarea>
+        <div class="row">
+          <button type="button" class="secondary" id="copyEnvLine">Copy .env line</button>
+        </div>
+        <p id="copyMsg" class="hidden ok" style="margin-top:10px">Copied GROUND_TRUTH_ACCESS_TOKEN line</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Step 3 — Test in Graph API Explorer</h2>
+      <ol>
+        <li>Select Meta App: <strong>MCP_APP</strong></li>
+        <li><span class="ok">User or Page → your name</span> (not App Token)</li>
+        <li>Add permissions: <code>ads_read</code>, <code>ads_management</code>, <code>business_management</code></li>
+        <li>Query: <code>me/adaccounts?fields=account_id,name,business&#123;id,name&#125;</code></li>
+        <li>Submit — you should see account JSON</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h2>Step 4 — Restart connector</h2>
+      <pre style="margin:0;white-space:pre-wrap">python ground_truth_mcp_server.py --http</pre>
+      <p style="margin:10px 0 0;color:var(--muted)">Then open <code>test-accounts.html</code></p>
+    </div>
+  </div>
+
+  <script>
+    const DEFAULT_APP_ID = "2095507501333711";
+    const SCOPES = "ads_read,ads_management,business_management,public_profile";
+    const REDIRECT = "https://www.facebook.com/connect/login_success.html";
+
+    const appInput = document.getElementById("appId");
+    appInput.value = DEFAULT_APP_ID;
+
+    function appId() {
+      return (appInput.value || DEFAULT_APP_ID).trim();
+    }
+
+    function oauthUrl() {
+      const id = encodeURIComponent(appId());
+      const scope = encodeURIComponent(SCOPES);
+      const redirect = encodeURIComponent(REDIRECT);
+      return `https://www.facebook.com/v21.0/dialog/oauth?client_id=${id}&redirect_uri=${redirect}&scope=${scope}&response_type=token`;
+    }
+
+    document.getElementById("rolesLink").href =
+      `https://developers.facebook.com/apps/${DEFAULT_APP_ID}/roles/roles/`;
+
+    document.getElementById("openOAuth").addEventListener("click", () => {
+      window.open(oauthUrl(), "_blank", "noopener");
+    });
+
+    document.getElementById("openExplorer").addEventListener("click", () => {
+      window.open("https://developers.facebook.com/tools/explorer/", "_blank", "noopener");
+    });
+
+    document.getElementById("copyEnvLine").addEventListener("click", async () => {
+      const token = document.getElementById("tokenOut").value.trim();
+      if (!token) return;
+      const line = `GROUND_TRUTH_ACCESS_TOKEN=${token}`;
+      await navigator.clipboard.writeText(line);
+      const msg = document.getElementById("copyMsg");
+      msg.classList.remove("hidden");
+      setTimeout(() => msg.classList.add("hidden"), 2500);
+    });
+
+    appInput.addEventListener("input", () => {
+      document.getElementById("rolesLink").href =
+        `https://developers.facebook.com/apps/${appId()}/roles/roles/`;
+      document.getElementById("appLabel").textContent = appId();
+    });
+  </script>
+</body>
+</html>

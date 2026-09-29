@@ -1,0 +1,13 @@
+---
+description: Ground Truth connector mirrors meta-mcp-connector
+alwaysApply: true
+---
+
+# Clone of meta-mcp-connector
+
+This project was cloned from `c:\htmls\meta-mcp-connector` (Cloud Run + Claude OAuth + MCP tools).
+
+1. Mirror Meta's deploy/OAuth/tool patterns when adding features
+2. Use `GROUND_TRUTH_*` env vars and `ground_truth_mcp_server.py`
+3. Never copy Meta's `.env` or `FACEBOOK_*` credentials into this project
+4. This project gets its own GitHub remote — do not push it to the Meta repo

@@ -1,0 +1,295 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ground Truth Account Spend â€” Ground Truth MCP</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1117;
+      --panel: #171a22;
+      --border: #2a2f3a;
+      --text: #e8eaed;
+      --muted: #9aa0a6;
+      --accent: #6ea8fe;
+      --danger: #f28b82;
+      --success: #81c995;
+      --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .wrap { max-width: 1280px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 1.5rem; font-weight: 600; }
+    .sub { color: var(--muted); margin-bottom: 20px; font-size: 0.95rem; }
+    .toolbar {
+      display: flex; flex-wrap: wrap; gap: 12px; align-items: end;
+      margin-bottom: 20px; padding: 16px;
+      background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    }
+    label { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; color: var(--muted); }
+    input, button {
+      font: inherit; border-radius: 6px; border: 1px solid var(--border);
+      background: var(--bg); color: var(--text); padding: 8px 10px;
+    }
+    input { min-width: 160px; }
+    button {
+      cursor: pointer; background: var(--accent); color: #0b1220;
+      border: none; font-weight: 600; padding: 9px 16px;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px; margin-bottom: 20px;
+    }
+    .stat {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 14px 16px;
+    }
+    .stat .label {
+      color: var(--muted); font-size: 0.78rem;
+      text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .stat .value { font-size: 1.35rem; font-weight: 600; margin-top: 4px; }
+    .stat .subvalue { font-size: 0.82rem; color: var(--muted); margin-top: 4px; }
+    .stat.highlight-high { border-color: #2b4a36; }
+    .stat.highlight-low { border-color: #4a4028; }
+    .alert {
+      padding: 12px 14px; border-radius: 8px; margin-bottom: 16px;
+      border: 1px solid var(--border); background: var(--panel);
+    }
+    .alert.error { border-color: #5c2b2b; color: var(--danger); }
+    .alert.ok { border-color: #2b4a36; color: var(--success); }
+    .bars { margin: 20px 0; display: flex; flex-direction: column; gap: 8px; }
+    .bar-row { display: grid; grid-template-columns: 200px 1fr 90px; gap: 12px; align-items: center; font-size: 0.88rem; }
+    .bar-label { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar-track { height: 22px; background: #1d212b; border-radius: 4px; overflow: hidden; }
+    .bar-fill { height: 100%; background: var(--accent); border-radius: 4px; min-width: 2px; }
+    .bar-value { text-align: right; font-variant-numeric: tabular-nums; }
+    table {
+      width: 100%; border-collapse: collapse;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; overflow: hidden;
+    }
+    th, td {
+      padding: 10px 12px; text-align: left;
+      border-bottom: 1px solid var(--border); font-size: 0.92rem; vertical-align: top;
+    }
+    th {
+      background: #1d212b; color: var(--muted); font-size: 0.78rem;
+      text-transform: uppercase; letter-spacing: 0.04em; position: sticky; top: 0;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+    tr.row-high td:first-child { border-left: 3px solid var(--success); }
+    tr.row-low td:first-child { border-left: 3px solid var(--warn); }
+    tr.row-zero td { color: var(--muted); }
+    .mono { font-family: ui-monospace, Consolas, monospace; font-size: 0.86rem; }
+    .scroll { overflow: auto; max-height: 70vh; border-radius: 8px; }
+    .caption { margin-top: 10px; color: var(--muted); font-size: 0.85rem; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Ground Truth Account Spend</h1>
+    <p class="sub">
+      Spend per ad account ranked highest to lowest.<br />
+      Open via <code id="pageUrl"></code> (not as a local file).
+    </p>
+
+    <div class="toolbar">
+      <label>
+        Connector base URL
+        <input id="baseUrl" type="url" />
+      </label>
+      <label>
+        Date (YYYY-MM-DD)
+        <input id="reportDate" type="date" />
+      </label>
+      <button id="loadBtn" type="button">Load spend</button>
+    </div>
+
+    <div id="message" hidden></div>
+
+    <div class="stats">
+      <div class="stat"><div class="label">Total spend</div><div class="value" id="statTotal">â€”</div></div>
+      <div class="stat"><div class="label">Accounts with spend</div><div class="value" id="statActive">â€”</div></div>
+      <div class="stat highlight-high">
+        <div class="label">Highest</div>
+        <div class="value" id="statHigh">â€”</div>
+        <div class="subvalue" id="statHighName">â€”</div>
+      </div>
+      <div class="stat highlight-low">
+        <div class="label">Lowest (non-zero)</div>
+        <div class="value" id="statLow">â€”</div>
+        <div class="subvalue" id="statLowName">â€”</div>
+      </div>
+    </div>
+
+    <h2 style="font-size:1.05rem;margin:0 0 12px;">Spend by account</h2>
+    <div class="bars" id="bars"><p style="color:var(--muted)">Load data to see chart.</p></div>
+
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>Account ID</th>
+            <th>Name</th>
+            <th>Parent business</th>
+            <th class="num">Spend (USD)</th>
+            <th class="num">Impressions</th>
+            <th class="num">Clicks</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="8">Click â€œLoad spendâ€ to fetch data.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="caption" id="caption">Source: Ground Truth MCP connector Â· not loaded</p>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    function yesterdayISO() {
+      const d = new Date();
+      d.setDate(d.getDate() - 1);
+      return d.toISOString().slice(0, 10);
+    }
+
+    function baseUrl() {
+      if (window.location.protocol.startsWith("http")) {
+        return window.location.origin;
+      }
+      return "http://127.0.0.1:8001";
+    }
+
+    $("baseUrl").value = baseUrl();
+    $("reportDate").value = yesterdayISO();
+    $("pageUrl").textContent = baseUrl() + "/account-spend";
+
+    function usd(n) {
+      return Number(n || 0).toLocaleString("en-US", {
+        style: "currency", currency: "USD",
+        minimumFractionDigits: 2, maximumFractionDigits: 2,
+      });
+    }
+
+    function int(n) {
+      return Number(n || 0).toLocaleString("en-US");
+    }
+
+    function esc(s) {
+      return String(s ?? "")
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    function showMessage(text, tone) {
+      const el = $("message");
+      el.hidden = false;
+      el.className = "alert " + (tone || "");
+      el.textContent = text;
+    }
+
+    function hideMessage() { $("message").hidden = true; }
+
+    function renderBars(accounts, maxSpend) {
+      const withSpend = accounts.filter((a) => a.spend > 0);
+      if (!withSpend.length) {
+        $("bars").innerHTML = '<p style="color:var(--muted)">No spend on this date.</p>';
+        return;
+      }
+      $("bars").innerHTML = withSpend.map((a) => {
+        const pct = maxSpend > 0 ? (a.spend / maxSpend) * 100 : 0;
+        return `<div class="bar-row">
+          <div class="bar-label" title="${esc(a.name)}">${esc(a.name)}</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+          <div class="bar-value">${usd(a.spend)}</div>
+        </div>`;
+      }).join("");
+    }
+
+    async function loadSpend() {
+      hideMessage();
+      const base = $("baseUrl").value.replace(/\/$/, "");
+      const reportDate = $("reportDate").value;
+      const btn = $("loadBtn");
+      btn.disabled = true;
+      $("rows").innerHTML = '<tr><td colspan="8">Loadingâ€¦</td></tr>';
+      $("bars").innerHTML = '<p style="color:var(--muted)">Loadingâ€¦</p>';
+
+      try {
+        const url = `${base}/api/account-spend?date=${encodeURIComponent(reportDate)}`;
+        const res = await fetch(url);
+        let data;
+        try { data = await res.json(); } catch {
+          throw new Error(res.status === 404
+            ? "404 â€” restart ground_truth_mcp_server.py to load /api/account-spend"
+            : `HTTP ${res.status}`);
+        }
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+
+        const accounts = data.accounts || [];
+        const withSpend = accounts.filter((a) => a.spend > 0);
+        const maxSpend = withSpend.length ? withSpend[0].spend : 0;
+
+        $("statTotal").textContent = usd(data.total_spend);
+        $("statActive").textContent = `${data.accounts_with_spend} / ${data.account_count}`;
+        $("statHigh").textContent = data.highest ? usd(data.highest.spend) : "â€”";
+        $("statHighName").textContent = data.highest ? data.highest.name : "â€”";
+        $("statLow").textContent = data.lowest ? usd(data.lowest.spend) : "â€”";
+        $("statLowName").textContent = data.lowest ? data.lowest.name : "â€”";
+
+        renderBars(accounts, maxSpend);
+
+        const highId = data.highest?.account_id || "";
+        const lowId = data.lowest?.account_id || "";
+
+        $("rows").innerHTML = accounts.map((a, i) => {
+          let cls = "";
+          if (a.account_id === highId) cls = "row-high";
+          else if (a.account_id === lowId && a.spend > 0) cls = "row-low";
+          else if (a.spend === 0) cls = "row-zero";
+          return `<tr class="${cls}">
+            <td>${i + 1}</td>
+            <td class="mono">${esc(a.account_id)}</td>
+            <td>${esc(a.name)}</td>
+            <td>${esc(a.parent_business_name || "â€”")}</td>
+            <td class="num">${usd(a.spend)}</td>
+            <td class="num">${int(a.impressions)}</td>
+            <td class="num">${int(a.clicks)}</td>
+            <td>${esc(a.account_status_label || a.status || "â€”")}</td>
+          </tr>`;
+        }).join("") || '<tr><td colspan="8">No accounts returned.</td></tr>';
+
+        showMessage(`Loaded ${data.account_count} accounts for ${data.date}`, "ok");
+        $("caption").textContent = `Source: Ground Truth MCP Â· ${data.date} Â· loaded ${new Date().toLocaleString()}`;
+      } catch (err) {
+        $("rows").innerHTML = '<tr><td colspan="8">Request failed.</td></tr>';
+        $("bars").innerHTML = "";
+        const hint = window.location.protocol === "file:"
+          ? "Open http://127.0.0.1:8001/account-spend in your browser."
+          : err.message;
+        showMessage(hint, "error");
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    $("loadBtn").addEventListener("click", loadSpend);
+    loadSpend();
+  </script>
+</body>
+</html>
