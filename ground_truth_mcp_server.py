@@ -1,9 +1,10 @@
 """
-Ground Truth MCP connector — plain-language access to Meta / Facebook ads via Graph API.
+Ground Truth MCP connector — plain-language access to GroundTruth ad reporting.
 
-Users ask in natural language about campaigns, ad sets, ads, and performance.
-Data is fetched live from the Facebook Marketing API using GROUND_TRUTH_APP_ID
-and GROUND_TRUTH_APP_SECRET (app access token).
+Users ask in natural language about accounts, campaigns, ad groups, creatives,
+locations, audiences, and performance. Data is fetched live from the
+GroundTruth Reporting API (reporting.groundtruth.com) using
+GROUND_TRUTH_USER_ID + GROUND_TRUTH_API_KEY.
 
 Run:
   python ground_truth_mcp_server.py           # stdio (Claude Desktop / Cursor)
@@ -12,9 +13,9 @@ Run:
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
-import logging
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -30,7 +31,7 @@ try:
 except ImportError:
     from mcp.server import MCPServer as FastMCP
 
-from ground_truth_api import MetaGraphError, graph_client
+from ground_truth_api import GroundTruthError, gt_client, metric
 
 # ---------------------------------------------------------------------------
 # Config
@@ -61,7 +62,7 @@ def _resolve_public_url() -> str:
     """
     Claude custom connectors need OAuth DCR. Enable when MCP_PUBLIC_URL is set
     (deploy script sets this). Git → Cloud Run often omits it — derive from
-    K_SERVICE + metadata, then known production fallbacks.
+    K_SERVICE + metadata.
     """
     for key in ("MCP_PUBLIC_URL", "BASE_URL", "SERVICE_URL"):
         raw = os.environ.get(key, "").strip().rstrip("/")
@@ -115,7 +116,7 @@ def _patch_claude_oauth_compat(scope: str = "ground-truth") -> None:
     import mcp.server.auth.handlers.register as register_mod
     import mcp.server.auth.routes as auth_routes
 
-    if getattr(auth_routes, "_meta_claude_patch", False):
+    if getattr(auth_routes, "_gt_claude_patch", False):
         return
 
     original_build = auth_routes.build_metadata
@@ -156,7 +157,7 @@ def _patch_claude_oauth_compat(scope: str = "ground-truth") -> None:
 
     auth_routes.create_protected_resource_routes = create_protected_resource_routes
 
-    register_mod._meta_cimd_client_id = None
+    register_mod._gt_cimd_client_id = None
     original_uuid4 = register_mod.uuid4
 
     class _CimdClientId:
@@ -167,9 +168,9 @@ def _patch_claude_oauth_compat(scope: str = "ground-truth") -> None:
             return self._value
 
     def uuid4_with_cimd():
-        cimd = register_mod._meta_cimd_client_id
+        cimd = register_mod._gt_cimd_client_id
         if cimd:
-            register_mod._meta_cimd_client_id = None
+            register_mod._gt_cimd_client_id = None
             return _CimdClientId(cimd)
         return original_uuid4()
 
@@ -196,7 +197,7 @@ def _patch_claude_oauth_compat(scope: str = "ground-truth") -> None:
                 ]
             client_id = data.get("client_id")
             if isinstance(client_id, str) and client_id.startswith("https://"):
-                register_mod._meta_cimd_client_id = client_id
+                register_mod._gt_cimd_client_id = client_id
             from starlette.requests import Request as StarletteRequest
 
             patched = json.dumps(data).encode()
@@ -206,16 +207,20 @@ def _patch_claude_oauth_compat(scope: str = "ground-truth") -> None:
 
             request = StarletteRequest(request.scope, receive)
         except Exception:
-            register_mod._meta_cimd_client_id = None
+            register_mod._gt_cimd_client_id = None
         return await original_handle(self, request)
 
     register_mod.RegistrationHandler.handle = handle
-    auth_routes._meta_claude_patch = True
+    auth_routes._gt_claude_patch = True
 
 
 def _build_mcp():
+    instructions = (
+        "GroundTruth ad reporting. Call help_ground_truth first if unsure. "
+        "Most reports need a campaign (numeric id or name) and a date range."
+    )
     if not MCP_PUBLIC_URL:
-        return FastMCP("ground-truth")
+        return FastMCP("ground-truth", instructions=instructions)
 
     _patch_claude_oauth_compat()
 
@@ -244,6 +249,7 @@ def _build_mcp():
     )
     return FastMCP(
         "ground-truth",
+        instructions=instructions,
         auth_server_provider=provider,
         auth=auth,
     )
@@ -252,17 +258,8 @@ def _build_mcp():
 mcp = _build_mcp()
 
 
-def _fb():
-    return graph_client()
-
-
-def _ensure_fb() -> None:
-    client = _fb()
-    client.validate_config()
-    if client.user_access_token:
-        client.validate_user_token()
-    else:
-        client.exchange_token()
+def _gt():
+    return gt_client()
 
 
 # ---------------------------------------------------------------------------
@@ -278,16 +275,34 @@ def _parse_date(value: str, *, default: Optional[date] = None) -> date:
         return default
     lowered = raw.lower()
     today = date.today()
-    if lowered in ("today",):
+    if lowered == "today":
         return today
-    if lowered in ("yesterday",):
+    if lowered == "yesterday":
         return today - timedelta(days=1)
+    if lowered.startswith("last_") and lowered.endswith("_days"):
+        return today - timedelta(days=int(lowered[5:-5]))
     return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+
+
+def _date_range(start_date: str, end_date: str = "") -> tuple[date, date]:
+    start = _parse_date(start_date)
+    end = _parse_date(end_date, default=start)
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def _default_range(start_date: str, end_date: str) -> tuple[date, date]:
+    """Empty start_date → last 30 days ending yesterday."""
+    if not (start_date or "").strip():
+        end = date.today() - timedelta(days=1)
+        return end - timedelta(days=29), end
+    return _date_range(start_date, end_date)
 
 
 def _fmt_int(n: Any) -> str:
     try:
-        return f"{int(n):,}"
+        return f"{int(float(n)):,}"
     except (TypeError, ValueError):
         return "0"
 
@@ -299,21 +314,12 @@ def _fmt_float(n: Any, *, decimals: int = 2) -> str:
         return "0.00"
 
 
-def _fmt_usd(n: Any) -> str:
+def _fmt_money(n: Any) -> str:
     return f"${_fmt_float(n)}"
 
 
-def _sum_field(rows: list[dict], field: str, *, as_float: bool = False) -> float:
-    total = 0.0
-    for r in rows:
-        v = r.get(field)
-        if v is None:
-            continue
-        try:
-            total += float(v) if as_float else int(v)
-        except (TypeError, ValueError):
-            pass
-    return total
+def _fmt_pct(n: Any) -> str:
+    return f"{_fmt_float(n)}%"
 
 
 def _table_lines(headers: list[str], rows: list[list[Any]]) -> str:
@@ -326,89 +332,93 @@ def _table_lines(headers: list[str], rows: list[list[Any]]) -> str:
     return "\n".join(lines)
 
 
-def _date_range(start_date: str, end_date: str = "") -> tuple[date, date]:
-    start = _parse_date(start_date)
-    end = _parse_date(end_date, default=start)
-    if end < start:
-        start, end = end, start
-    return start, end
+def _clamp(limit: int, hi: int) -> int:
+    return max(1, min(int(limit or hi), hi))
 
 
-def _filter_rows(
-    rows: list[dict[str, Any]],
-    *,
-    campaign: str = "",
-) -> list[dict[str, Any]]:
-    if not campaign.strip():
-        return rows
-    q = campaign.strip().lower()
-    return [
-        r
-        for r in rows
-        if q in (r.get("campaign_name") or "").lower()
-        or q in (r.get("campaign_id") or "").lower()
-        or q in (r.get("adset_name") or "").lower()
-        or q in (r.get("ad_name") or "").lower()
-    ]
+def _span(start: date, end: date) -> str:
+    return f"{start.isoformat()} to {end.isoformat()}"
 
 
-def _fetch_insights(
-    *,
-    level: str,
-    start: date,
-    end: date,
-    account_id: str = "",
-    breakdowns: Optional[str] = None,
-    campaign: str = "",
-    time_increment: Any = 1,
-) -> list[dict[str, Any]]:
-    client = _fb()
-    if campaign.strip():
-        return client.fetch_insights_for_campaign(
-            account_id,
-            campaign,
-            level=level,
-            since=start,
-            until=end,
-            breakdowns=breakdowns,
-            time_increment=time_increment,
-        )
-    return client.fetch_insights(
-        account_id,
-        level=level,
-        since=start,
-        until=end,
-        breakdowns=breakdowns,
-        time_increment=time_increment,
-    )
+def _safe(fn):
+    """Turn API/config errors into readable tool output instead of MCP errors."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (GroundTruthError, RuntimeError, ValueError, KeyError) as e:
+            return f"Error: {e}"
+
+    return wrapper
 
 
-def _aggregate_metrics(
-    rows: list[dict],
-    *,
-    group_by: Optional[str] = None,
-) -> dict[str, dict[str, float]]:
-    metrics = [
-        "amount_spent_usd",
-        "impressions",
-        "reach",
-        "clicks_all",
-        "purchases",
-        "meta_purchases",
-        "purchases_value",
-        "meta_purchase_value",
-    ]
-    buckets: dict[str, dict[str, float]] = defaultdict(
-        lambda: {m: 0.0 for m in metrics}
-    )
+def _campaign(campaign: str, account_id: str = "") -> str:
+    return _gt().resolve_campaign_id(campaign, account_id=account_id)
+
+
+_CORE = ("impressions", "clicks", "spend", "visits", "secondary_actions")
+
+
+def _sum(rows: list[dict[str, Any]], names=_CORE) -> dict[str, float]:
+    totals = {m: 0.0 for m in names}
     for r in rows:
-        label = str(r.get(group_by) or "(blank)") if group_by else "__total__"
+        for m in names:
+            totals[m] += metric(r, m)
+    return totals
+
+
+def _derived(t: dict[str, float]) -> list[str]:
+    out = []
+    imps, clicks, spend = t.get("impressions", 0), t.get("clicks", 0), t.get("spend", 0)
+    if imps:
+        out.append(f"CTR: {_fmt_pct(clicks / imps * 100)}")
+        out.append(f"CPM: {_fmt_money(spend / imps * 1000)}")
+    if clicks:
+        out.append(f"CPC: {_fmt_money(spend / clicks)}")
+    if t.get("visits"):
+        out.append(f"Cost per visit: {_fmt_money(spend / t['visits'])}")
+    return out
+
+
+def _group_table(
+    rows: list[dict[str, Any]],
+    label_fn,
+    *,
+    header: str,
+    limit: int,
+    sort_by: str = "impressions",
+    metrics=("impressions", "clicks", "ctr_calc", "spend", "visits"),
+) -> str:
+    buckets: dict[str, dict[str, float]] = defaultdict(lambda: {m: 0.0 for m in _CORE})
+    for r in rows:
+        label = str(label_fn(r) or "(unknown)")
+        for m in _CORE:
+            buckets[label][m] += metric(r, m)
+    ranked = sorted(buckets.items(), key=lambda kv: kv[1].get(sort_by, 0), reverse=True)
+    ranked = ranked[:limit]
+
+    names = {
+        "impressions": "Impressions",
+        "clicks": "Clicks",
+        "ctr_calc": "CTR",
+        "spend": "Spend",
+        "visits": "Visits",
+        "secondary_actions": "Sec. actions",
+    }
+    body = []
+    for label, v in ranked:
+        row: list[Any] = [label[:60]]
         for m in metrics:
-            try:
-                buckets[label][m] += float(r.get(m) or 0)
-            except (TypeError, ValueError):
-                pass
-    return buckets
+            if m == "ctr_calc":
+                row.append(_fmt_pct(v["clicks"] / v["impressions"] * 100) if v["impressions"] else "—")
+            elif m == "spend":
+                row.append(_fmt_money(v["spend"]))
+            else:
+                row.append(_fmt_int(v[m]))
+        body.append(row)
+    return _table_lines([header] + [names[m] for m in metrics], body)
 
 
 # ---------------------------------------------------------------------------
@@ -417,949 +427,569 @@ def _aggregate_metrics(
 
 
 @mcp.tool()
-def help_meta() -> str:
-    """Explain what this Ground Truth ads connector can answer in simple language."""
+def help_ground_truth() -> str:
+    """Explain what this GroundTruth connector can answer in simple language."""
     return """You can ask things like:
 
-ACCOUNTS
-- "List my Ground Truth ad accounts"
-- "Spend across all accounts yesterday" (multi-account rollup)
-- "Is the Facebook integration configured?"
+ACCOUNTS & CAMPAIGNS
+- "List my GroundTruth accounts" / "Spend across all accounts last month"
+- "List campaigns for account 12345" / "Find campaigns named Summer"
+- "Is the GroundTruth integration configured?"
 
-CAMPAIGNS, AD SETS & CREATIVES
-- "List campaigns for Drag Race"
-- "List ad sets"
-- "Show ads / creatives with preview URLs"
-- "Who does this ad set target?"
-- "Campaign budgets and status"
-- "Pause campaign X" / "Activate campaign X" (needs ads_management)
+PERFORMANCE
+- "Summary for the org last 30 days"
+- "Account 12345 totals for August"
+- "Campaign Summer Sale summary from 2026-08-01 to 2026-08-31"
+- "Daily trend for campaign 98765 last 14 days"
+- "Ad group performance for campaign Summer Sale"
+- "Top creatives for campaign 98765"
 
-PERFORMANCE (live from Facebook Graph API)
-- "Ground Truth ads summary from 2026-08-01 to 2026-08-15"
-- "Daily spend and impressions last 7 days"
-- "Hourly performance yesterday"
-- "Break down by campaign / ad set / ad / platform / placement"
-- "Break down by age / gender / region / state / country / DMA"
-- "Conversions by state for last 7 days"
-- "Reach and frequency by campaign"
-- "Top ads by spend this month"
+BREAKDOWNS (per campaign)
+- Locations: state / DMA / zipcode / county
+- Demographics: age / gender / age × gender
+- Device type, hour of day (time of day)
+- Audiences: behavioral audience / category / brand affinity
+- Inventory: publisher / network
+- Store visits by POI / product (location-level visits)
+- Audio: streaming genre / podcast topic / podcast series / audio publisher
 
-Data is fetched live — not from a database cache.
-Dates are YYYY-MM-DD (or yesterday / today).
-Set GROUND_TRUTH_AD_ACCOUNT_ID in .env or pass account_id (act_…)."""
+CONVERSIONS
+- "Conversion tracking for account 12345 last week"
 
-
-@mcp.tool()
-def list_accounts(limit: int = 20) -> str:
-    """List Ground Truth ad accounts accessible with the configured Facebook token."""
-    rows = _fb().list_all_ad_accounts(limit=max(1, min(limit, 100)))
-    if not rows:
-        return "No ad accounts returned. Check GROUND_TRUTH_APP_ID / GROUND_TRUTH_APP_SECRET."
-    body = [
-        [
-            f"act_{r.get('account_id', '')}",
-            r.get("name") or "",
-            r.get("parent_business_name") or "—",
-            r.get("parent_business_id") or "—",
-            r.get("relationship") or "",
-            r.get("currency") or "",
-            r.get("account_status_label") or r.get("account_status") or "",
-        ]
-        for r in rows
-    ]
-    return (
-        f"Found {len(rows)} ad account(s) via Graph API.\n"
-        + _table_lines(
-            [
-                "Account ID",
-                "Name",
-                "Parent Business",
-                "Parent Business ID",
-                "Relationship",
-                "Currency",
-                "Status",
-            ],
-            body,
-        )
-    )
-
-
-@mcp.tool()
-def list_campaigns(
-    search: str = "",
-    account_id: str = "",
-    limit: int = 50,
-) -> str:
-    """List campaigns from the Facebook ad account (live Graph API)."""
-    rows = _fb().list_campaign_objects(
-        account_id=account_id, search=search, limit=max(1, min(limit, 200))
-    )
-    if not rows:
-        return "No campaigns matched."
-    body = [
-        [
-            r.get("name") or "",
-            r.get("id") or "",
-            r.get("status") or "",
-            r.get("objective") or "",
-        ]
-        for r in rows
-    ]
-    return (
-        f"Found {len(rows)} campaign(s).\n"
-        + _table_lines(["Campaign", "ID", "Status", "Objective"], body)
-    )
-
-
-@mcp.tool()
-def list_adsets(
-    search: str = "",
-    account_id: str = "",
-    limit: int = 50,
-) -> str:
-    """List ad sets from the Facebook ad account (live Graph API)."""
-    rows = _fb().list_adset_objects(
-        account_id=account_id, search=search, limit=max(1, min(limit, 200))
-    )
-    if not rows:
-        return "No ad sets matched."
-    body = [
-        [
-            r.get("name") or "",
-            r.get("id") or "",
-            r.get("status") or "",
-            r.get("campaign_id") or "",
-        ]
-        for r in rows
-    ]
-    return (
-        f"Found {len(rows)} ad set(s).\n"
-        + _table_lines(["Ad set", "ID", "Status", "Campaign ID"], body)
-    )
+Dates are YYYY-MM-DD, or today / yesterday / last_7_days / last_30_days.
+Campaign can be a numeric id or a name (names need GROUND_TRUTH_ORG_ID).
+GroundTruth metrics: visits = attributed store visits, secondary actions =
+click-to-call / directions / website / more-info / coupon."""
 
 
 @mcp.tool()
 def get_integration_status() -> str:
-    """Check Facebook app credentials and token health (no secrets exposed)."""
-    client = _fb()
+    """Check GroundTruth API credentials and connectivity (no secrets exposed)."""
+    c = _gt()
     lines = [
-        "Facebook integration (Graph API)",
-        f"App ID: {'configured' if client.app_id else 'missing GROUND_TRUTH_APP_ID'}",
-        f"App secret: {'configured' if client.app_secret else 'missing GROUND_TRUTH_APP_SECRET'}",
-        f"User token: {'configured' if client.user_access_token else 'not set (GROUND_TRUTH_ACCESS_TOKEN)'}",
-        f"Default account: act_{client.default_account}" if client.default_account else "Default account: not set (GROUND_TRUTH_AD_ACCOUNT_ID)",
+        "GroundTruth Reporting API",
+        f"Base URL: {c.base_url}",
+        f"User ID: {'configured' if c.user_id else 'missing GROUND_TRUTH_USER_ID'}",
+        f"API key: {'configured' if c.api_key else 'missing GROUND_TRUTH_API_KEY'}",
+        f"Organization ID: {c.org_id or 'not set (GROUND_TRUTH_ORG_ID) — needed for account/campaign lists'}",
+        f"Default account: {c.default_account or 'not set (GROUND_TRUTH_ACCOUNT_ID)'}",
     ]
     try:
-        client.validate_config()
-        if client.user_access_token:
-            lines.append("Auth mode: user token (GROUND_TRUTH_ACCESS_TOKEN)")
-            try:
-                debug = client.validate_user_token()
-            except MetaGraphError as e:
-                lines.append(f"User token: error — {e}")
-                return "\n".join(lines)
-            lines.append(f"User token valid: {debug.get('is_valid', 'unknown')}")
-            token_app = debug.get("app_id")
-            if token_app:
-                lines.append(f"Token app ID: {token_app}")
-            scopes = debug.get("scopes") or []
-            if scopes:
-                lines.append("User token scopes: " + ", ".join(scopes))
-            exp = debug.get("expires_at")
-            if exp:
-                lines.append(
-                    f"User token expires: {datetime.utcfromtimestamp(int(exp)).isoformat()}Z"
-                )
-        else:
-            client.exchange_token()
-            lines.append("Auth mode: app token only (client_credentials)")
-            lines.append("App token: OK")
-            lines.append(
-                "Note: set GROUND_TRUTH_ACCESS_TOKEN with ads_read to list accounts and pull insights."
-            )
-    except (MetaGraphError, RuntimeError) as e:
+        c.validate_config()
+    except RuntimeError as e:
+        lines.append(f"Status: {e}")
+        return "\n".join(lines)
+    if not c.org_id:
+        lines.append("Status: credentials present; set GROUND_TRUTH_ORG_ID to run a live check.")
+        return "\n".join(lines)
+    try:
+        end = date.today() - timedelta(days=1)
+        rows = c.org_totals(end - timedelta(days=6), end)
+        accounts = {str(r.get("account_id")) for r in rows if r.get("account_id")}
+        lines.append(
+            f"Status: OK — last 7 days returned {len(rows)} campaign row(s) "
+            f"across {len(accounts)} account(s)."
+        )
+    except (GroundTruthError, ValueError) as e:
         lines.append(f"Status: error — {e}")
     return "\n".join(lines)
 
 
 @mcp.tool()
-def get_ads_summary(
-    start_date: str,
+@_safe
+def list_accounts(
+    start_date: str = "",
     end_date: str = "",
-    campaign: str = "",
-    account_id: str = "",
+    organization_id: str = "",
+    limit: int = 100,
 ) -> str:
-    """Get Ground Truth ads KPI totals for a date range (live Graph API insights)."""
-    start, end = _date_range(start_date, end_date)
-    # Account-level aggregate for the window (time_increment=all_days). Campaign
-    # filter resolves to the campaign edge when possible (D-5).
-    rows = _fetch_insights(
-        level="account" if not campaign.strip() else "campaign",
-        start=start,
-        end=end,
-        account_id=account_id,
-        campaign=campaign,
-        time_increment="all_days",
-    )
-    if campaign.strip():
-        rows = _filter_rows(rows, campaign=campaign)
+    """List GroundTruth ad accounts in the organization with spend for a date range (default last 30 days)."""
+    start, end = _default_range(start_date, end_date)
+    rows = _gt().list_accounts(start, end, organization_id)[: _clamp(limit, 500)]
     if not rows:
-        return f"No ad data found for {start.isoformat()} to {end.isoformat()}."
-
-    spend = _sum_field(rows, "amount_spent_usd", as_float=True)
-    impressions = _sum_field(rows, "impressions")
-    # Reach is not additive across rows — use max for multi-row, else the value.
-    reach_vals = [int(r.get("reach") or 0) for r in rows]
-    reach = max(reach_vals) if len(reach_vals) > 1 else (reach_vals[0] if reach_vals else 0)
-    clicks = _sum_field(rows, "clicks_all")
-    purchases = _sum_field(rows, "purchases")
-    purchase_value = _sum_field(rows, "purchases_value", as_float=True)
-
-    lines = [
-        "Ground Truth ads summary (Graph API)",
-        f"Dates: {start.isoformat()} to {end.isoformat()}",
-    ]
-    if account_id.strip():
-        lines.append(f"Account: {account_id.strip()}")
-    elif _fb().default_account:
-        lines.append(f"Account: act_{_fb().default_account}")
-    if campaign.strip():
-        lines.append(f"Filter: {campaign.strip()}")
-    lines.extend([
-        f"Spend: {_fmt_usd(spend)}",
-        f"Impressions: {_fmt_int(impressions)}",
-        f"Reach: {_fmt_int(reach)}",
-        f"Clicks: {_fmt_int(clicks)}",
-        f"Purchases (omni): {_fmt_int(purchases)}",
-        f"Purchase value: {_fmt_usd(purchase_value)}",
-    ])
-    if clicks > 0:
-        lines.append(f"CPC: {_fmt_usd(spend / clicks)}")
-    if impressions > 0:
-        lines.append(f"CPM: {_fmt_usd(spend / impressions * 1000)}")
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def get_daily_trend(
-    start_date: str,
-    end_date: str = "",
-    campaign: str = "",
-    account_id: str = "",
-) -> str:
-    """Daily Ground Truth ads spend, impressions, clicks, and purchases (Graph API)."""
-    start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
-        level="account" if not campaign.strip() else "campaign",
-        start=start,
-        end=end,
-        account_id=account_id,
-        campaign=campaign,
-        time_increment=1,
-    )
-    if campaign.strip():
-        rows = _filter_rows(rows, campaign=campaign)
-
-    daily: dict[str, dict[str, float]] = defaultdict(
-        lambda: {"spend": 0.0, "impressions": 0, "clicks": 0, "purchases": 0}
-    )
-    for r in rows:
-        d = str(r.get("date_start") or r.get("day") or "")[:10]
-        if not d:
-            continue
-        daily[d]["spend"] += float(r.get("amount_spent_usd") or 0)
-        daily[d]["impressions"] += int(r.get("impressions") or 0)
-        daily[d]["clicks"] += int(r.get("clicks_all") or 0)
-        daily[d]["purchases"] += int(r.get("purchases") or 0)
-
-    if not daily:
-        label = campaign.strip() or "account"
-        return f"No daily data for {label} in that range."
-
-    table = [
-        [
-            d,
-            _fmt_usd(v["spend"]),
-            _fmt_int(v["impressions"]),
-            _fmt_int(v["clicks"]),
-            _fmt_int(v["purchases"]),
-        ]
-        for d, v in sorted(daily.items())
-    ]
-    return (
-        f"Daily trend (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        + _table_lines(["Date", "Spend", "Impressions", "Clicks", "Purchases"], table)
-    )
-
-
-@mcp.tool()
-def get_performance_breakdown(
-    start_date: str,
-    end_date: str = "",
-    by: str = "campaign",
-    campaign: str = "",
-    account_id: str = "",
-    limit: int = 25,
-) -> str:
-    """Break down Ground Truth ads by campaign, adset, ad, platform, placement, region/state, country, or DMA."""
-    # level sets row granularity; breakdowns sets dimensional splits (D-2).
-    # Meta Insights "region" is state/province (e.g. California, Maharashtra).
-    dim_map = {
-        "campaign": ("campaign", "campaign_name", None),
-        "adset": ("adset", "adset_name", None),
-        "ad": ("ad", "ad_name", None),
-        "platform": ("ad", "publisher_platform", "publisher_platform"),
-        "placement": ("ad", "placement", "publisher_platform,platform_position"),
-        "region": ("campaign", "region", "region"),
-        "state": ("campaign", "region", "region"),
-        "country": ("campaign", "country", "country"),
-        "dma": ("campaign", "dma", "dma"),
-        "age": ("campaign", "age", "age"),
-        "gender": ("campaign", "gender", "gender"),
-        "age_gender": ("campaign", "age_gender", "age,gender"),
-        "demographics": ("campaign", "age_gender", "age,gender"),
-    }
-    key = (by or "campaign").strip().lower()
-    spec = dim_map.get(key)
-    if not spec:
-        return (
-            "Unknown breakdown. Use by=campaign|adset|ad|platform|placement|"
-            "region|state|country|dma|age|gender|age_gender."
-        )
-
-    start, end = _date_range(start_date, end_date)
-    level, col, breakdowns = spec
-    label = {
-        "region": "state/region",
-        "state": "state/region",
-        "age_gender": "age × gender",
-        "demographics": "age × gender",
-    }.get(key, key)
-
-    rows = _fetch_insights(
-        level=level,
-        start=start,
-        end=end,
-        account_id=account_id,
-        breakdowns=breakdowns,
-        campaign=campaign,
-        time_increment="all_days",
-    )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
-        rows = _filter_rows(rows, campaign=campaign)
-
-    if key == "placement":
-        for r in rows:
-            r["placement"] = (
-                f"{r.get('publisher_platform') or 'unknown'}/"
-                f"{r.get('platform_position') or 'unknown'}"
-            )
-    if key in ("age_gender", "demographics"):
-        for r in rows:
-            r["age_gender"] = f"{r.get('age') or '?'}/{r.get('gender') or '?'}"
-
-    if not rows:
-        return f"No data for breakdown by {label} in that range."
-
-    buckets = _aggregate_metrics(rows, group_by=col)
-    ranked = sorted(
-        buckets.items(),
-        key=lambda kv: kv[1]["amount_spent_usd"],
-        reverse=True,
-    )[: max(1, min(limit, 100))]
-
-    table = [
-        [
-            name if name and name != "(blank)" else "(unnamed)",
-            _fmt_usd(v["amount_spent_usd"]),
-            _fmt_int(v["impressions"]),
-            _fmt_int(v["clicks_all"]),
-            _fmt_int(v["purchases"]),
-        ]
-        for name, v in ranked
-    ]
-    return (
-        f"Performance by {label} (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        + _table_lines(
-            [label.title(), "Spend", "Impressions", "Clicks", "Purchases"], table
-        )
-    )
-
-
-@mcp.tool()
-def get_conversions_by_region(
-    start_date: str,
-    end_date: str = "",
-    campaign: str = "",
-    account_id: str = "",
-    geo: str = "region",
-    limit: int = 50,
-) -> str:
-    """
-    Conversions (purchases) and spend broken down by geographic region/state.
-
-    Meta Insights uses breakdowns=region for state/province (e.g. California,
-    Texas, Maharashtra). Use geo=country or geo=dma for country or US DMA.
-    """
-    geo_key = (geo or "region").strip().lower()
-    if geo_key in ("state", "states", "province", "provinces"):
-        geo_key = "region"
-    if geo_key not in ("region", "country", "dma"):
-        return "Unknown geo. Use geo=region|state|country|dma."
-
-    start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
-        level="campaign",
-        start=start,
-        end=end,
-        account_id=account_id,
-        breakdowns=geo_key,
-        campaign=campaign,
-        time_increment="all_days",
-    )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
-        rows = _filter_rows(rows, campaign=campaign)
-
-    if not rows:
-        return (
-            f"No geographic conversion data ({geo_key}) in that range. "
-            "Confirm the account has delivery and purchase events."
-        )
-
-    buckets: dict[str, dict[str, float]] = defaultdict(
-        lambda: {
-            "amount_spent_usd": 0.0,
-            "impressions": 0.0,
-            "clicks_all": 0.0,
-            "purchases": 0.0,
-            "purchases_value": 0.0,
-        }
-    )
-    for r in rows:
-        name = str(r.get(geo_key) or "").strip() or "(unknown)"
-        buckets[name]["amount_spent_usd"] += float(r.get("amount_spent_usd") or 0)
-        buckets[name]["impressions"] += float(r.get("impressions") or 0)
-        buckets[name]["clicks_all"] += float(r.get("clicks_all") or 0)
-        buckets[name]["purchases"] += float(r.get("purchases") or 0)
-        buckets[name]["purchases_value"] += float(r.get("purchases_value") or 0)
-
-    ranked = sorted(
-        buckets.items(),
-        key=lambda kv: (kv[1]["purchases"], kv[1]["amount_spent_usd"]),
-        reverse=True,
-    )[: max(1, min(limit, 200))]
-
-    label = "State/Region" if geo_key == "region" else geo_key.upper()
-    table = []
-    for name, v in ranked:
-        spend = float(v["amount_spent_usd"])
-        purchases = int(v["purchases"])
-        cpa = (spend / purchases) if purchases else 0.0
-        table.append(
-            [
-                name,
-                _fmt_int(purchases),
-                _fmt_usd(v["purchases_value"]),
-                _fmt_usd(spend),
-                _fmt_usd(cpa) if purchases else "—",
-                _fmt_int(v["impressions"]),
-                _fmt_int(v["clicks_all"]),
-            ]
-        )
-
-    total_purchases = int(sum(v["purchases"] for _, v in buckets.items()))
-    total_spend = sum(v["amount_spent_usd"] for _, v in buckets.items())
-    return (
-        f"Conversions by {label.lower()} (Graph API breakdowns={geo_key})\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        f"Totals: {total_purchases:,} purchases · {_fmt_usd(total_spend)} spend · "
-        f"{len(buckets)} {label.lower()}(s)\n"
-        + _table_lines(
-            [label, "Purchases", "Purchase value", "Spend", "CPA", "Impressions", "Clicks"],
-            table,
-        )
-    )
-
-
-@mcp.tool()
-def get_top_ads(
-    start_date: str,
-    end_date: str = "",
-    campaign: str = "",
-    account_id: str = "",
-    sort_by: str = "spend",
-    limit: int = 20,
-) -> str:
-    """Top-performing ads ranked by spend, impressions, clicks, or purchases."""
-    start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
-        level="ad",
-        start=start,
-        end=end,
-        account_id=account_id,
-        campaign=campaign,
-        time_increment="all_days",
-    )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
-        rows = _filter_rows(rows, campaign=campaign)
-    if not rows:
-        return "No ad-level data in that range."
-
-    buckets: dict[tuple[str, str, str], dict[str, float]] = defaultdict(
-        lambda: {
-            "amount_spent_usd": 0.0,
-            "impressions": 0.0,
-            "clicks_all": 0.0,
-            "purchases": 0.0,
-        }
-    )
-    for r in rows:
-        k = (
-            r.get("ad_name") or "(unnamed)",
-            r.get("adset_name") or "",
-            r.get("campaign_name") or "",
-        )
-        for m in ("amount_spent_usd", "impressions", "clicks_all", "purchases"):
-            buckets[k][m] += float(r.get(m) or 0)
-
-    sort_key = {
-        "spend": "amount_spent_usd",
-        "impressions": "impressions",
-        "clicks": "clicks_all",
-        "purchases": "purchases",
-    }.get((sort_by or "spend").lower(), "amount_spent_usd")
-
-    ranked = sorted(buckets.items(), key=lambda kv: kv[1][sort_key], reverse=True)[
-        : max(1, min(limit, 100))
-    ]
-    table = [
-        [
-            ad[:50],
-            adset[:40],
-            _fmt_usd(v["amount_spent_usd"]),
-            _fmt_int(v["impressions"]),
-            _fmt_int(v["clicks_all"]),
-            _fmt_int(v["purchases"]),
-        ]
-        for (ad, adset, _), v in ranked
-    ]
-    return (
-        f"Top ads by {sort_by} (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        + _table_lines(
-            ["Ad", "Ad set", "Spend", "Impressions", "Clicks", "Purchases"], table
-        )
-    )
-
-
-@mcp.tool()
-def list_creatives(
-    search: str = "",
-    account_id: str = "",
-    limit: int = 25,
-) -> str:
-    """List ads with creative thumbnails, preview URLs, and Ads Manager links."""
-    rows = _fb().list_ad_creatives(
-        account_id=account_id,
-        search=search,
-        limit=max(1, min(limit, 100)),
-        include_preview=True,
-    )
-    if not rows:
-        return "No ads/creatives found."
+        return f"No accounts with data for {_span(start, end)}."
     body = [
         [
-            (r.get("ad_name") or "")[:40],
-            r.get("ad_id") or "",
-            r.get("status") or "",
-            (r.get("title") or "")[:30],
-            r.get("cta") or "",
-            (r.get("thumbnail_url") or r.get("image_url") or "")[:60] or "—",
-            (r.get("preview_url") or r.get("ads_manager_url") or "")[:70] or "—",
+            r["account_id"],
+            r["account_name"][:40],
+            r["account_status"] or "—",
+            r["campaigns"],
+            _fmt_money(r["spend"]),
+            _fmt_int(r["impressions"]),
+            _fmt_int(r["clicks"]),
+            _fmt_int(r["visits"]),
+            r["currency"] or "",
         ]
         for r in rows
     ]
+    total = sum(r["spend"] for r in rows)
     return (
-        f"Found {len(rows)} ad creative(s).\n"
+        f"{len(rows)} account(s) · {_span(start, end)} · total spend {_fmt_money(total)}\n"
         + _table_lines(
-            ["Ad", "Ad ID", "Status", "Title", "CTA", "Thumbnail", "Preview / Ads Manager"],
+            ["Account ID", "Name", "Status", "Campaigns", "Spend", "Impressions", "Clicks", "Visits", "Currency"],
             body,
         )
     )
 
 
 @mcp.tool()
-def get_demographics_breakdown(
-    start_date: str,
-    end_date: str = "",
-    by: str = "age_gender",
-    campaign: str = "",
-    account_id: str = "",
-    limit: int = 50,
-) -> str:
-    """Break down Ground Truth ads performance by age, gender, or age×gender."""
-    key = (by or "age_gender").strip().lower().replace("-", "_").replace(" ", "_")
-    if key in ("demo", "demographics", "agegender"):
-        key = "age_gender"
-    if key not in ("age", "gender", "age_gender"):
-        return "Unknown demographic. Use by=age|gender|age_gender."
-
-    breakdowns = "age,gender" if key == "age_gender" else key
-    start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
-        level="campaign",
-        start=start,
-        end=end,
-        account_id=account_id,
-        breakdowns=breakdowns,
-        campaign=campaign,
-        time_increment="all_days",
-    )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
-        rows = _filter_rows(rows, campaign=campaign)
-    if not rows:
-        return f"No demographic data ({key}) in that range."
-
-    for r in rows:
-        if key == "age_gender":
-            r["bucket"] = f"{r.get('age') or '?'}/{r.get('gender') or '?'}"
-        else:
-            r["bucket"] = str(r.get(key) or "(unknown)")
-
-    buckets = _aggregate_metrics(rows, group_by="bucket")
-    ranked = sorted(
-        buckets.items(),
-        key=lambda kv: kv[1]["amount_spent_usd"],
-        reverse=True,
-    )[: max(1, min(limit, 200))]
-    table = [
-        [
-            name,
-            _fmt_usd(v["amount_spent_usd"]),
-            _fmt_int(v["impressions"]),
-            _fmt_int(v["reach"]),
-            _fmt_int(v["clicks_all"]),
-            _fmt_int(v["purchases"]),
-        ]
-        for name, v in ranked
-    ]
-    return (
-        f"Demographics by {key} (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        + _table_lines(
-            [key.replace("_", " × ").title(), "Spend", "Impressions", "Reach", "Clicks", "Purchases"],
-            table,
-        )
-    )
-
-
-@mcp.tool()
-def get_hourly_performance(
-    start_date: str,
-    end_date: str = "",
-    campaign: str = "",
-    account_id: str = "",
-    timezone: str = "advertiser",
-) -> str:
-    """Hourly Ground Truth ads performance (advertiser or audience timezone)."""
-    tz = (timezone or "advertiser").strip().lower()
-    if tz in ("audience", "user"):
-        breakdown = "hourly_stats_aggregated_by_audience_time_zone"
-        label = "audience timezone"
-    else:
-        breakdown = "hourly_stats_aggregated_by_advertiser_time_zone"
-        label = "advertiser timezone"
-
-    start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
-        level="campaign",
-        start=start,
-        end=end,
-        account_id=account_id,
-        breakdowns=breakdown,
-        campaign=campaign,
-        time_increment="all_days",
-    )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
-        rows = _filter_rows(rows, campaign=campaign)
-    if not rows:
-        return f"No hourly data ({label}) in that range."
-
-    buckets = _aggregate_metrics(rows, group_by="hour")
-    ranked = sorted(buckets.items(), key=lambda kv: kv[0])
-    table = [
-        [
-            hour or "(unknown)",
-            _fmt_usd(v["amount_spent_usd"]),
-            _fmt_int(v["impressions"]),
-            _fmt_int(v["clicks_all"]),
-            _fmt_int(v["purchases"]),
-        ]
-        for hour, v in ranked
-    ]
-    return (
-        f"Hourly performance ({label}, Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        + _table_lines(["Hour", "Spend", "Impressions", "Clicks", "Purchases"], table)
-    )
-
-
-@mcp.tool()
-def get_campaign_budgets(
+@_safe
+def list_campaigns(
     search: str = "",
     account_id: str = "",
-    limit: int = 50,
-) -> str:
-    """List campaign budgets and delivery status (daily / lifetime / remaining)."""
-    rows = _fb().list_campaign_budgets(
-        account_id=account_id, search=search, limit=max(1, min(limit, 200))
-    )
-    if not rows:
-        return "No campaigns found."
-    body = [
-        [
-            (r.get("campaign_name") or "")[:40],
-            r.get("campaign_id") or "",
-            r.get("effective_status") or r.get("status") or "",
-            r.get("daily_budget") or "—",
-            r.get("lifetime_budget") or "—",
-            r.get("budget_remaining") or "—",
-            r.get("objective") or "",
-        ]
-        for r in rows
-    ]
-    return (
-        f"Found {len(rows)} campaign budget row(s). Amounts are in account currency.\n"
-        + _table_lines(
-            ["Campaign", "ID", "Status", "Daily", "Lifetime", "Remaining", "Objective"],
-            body,
-        )
-    )
-
-
-@mcp.tool()
-def set_object_status(
-    object_id: str,
-    status: str,
-) -> str:
-    """
-    Pause or activate a Ground Truth campaign, ad set, or ad.
-
-    Requires GROUND_TRUTH_ACCESS_TOKEN with ads_management.
-    status must be ACTIVE or PAUSED. Pass the Graph object id (campaign/adset/ad).
-    """
-    desired = (status or "").strip().upper()
-    oid = (object_id or "").strip()
-    if not oid:
-        return "object_id is required (campaign, ad set, or ad id)."
-    if desired not in ("ACTIVE", "PAUSED"):
-        return "status must be ACTIVE or PAUSED."
-    try:
-        result = _fb().update_object_status(oid, desired)
-    except MetaGraphError as e:
-        return (
-            f"Failed to set status: {e}\n"
-            "Ensure GROUND_TRUTH_ACCESS_TOKEN has ads_management permission."
-        )
-    ok = result.get("success")
-    return (
-        f"Updated object {oid} → {desired}."
-        + (" (success)" if ok is True else f" Response: {result}")
-    )
-
-
-@mcp.tool()
-def get_adset_targeting(
-    search: str = "",
-    account_id: str = "",
-    limit: int = 25,
-) -> str:
-    """Show who each ad set targets (age, geo, interests, audiences, placements)."""
-    rows = _fb().get_adset_targeting(
-        account_id=account_id, search=search, limit=max(1, min(limit, 100))
-    )
-    if not rows:
-        return "No ad sets found."
-    body = [
-        [
-            (r.get("adset_name") or "")[:35],
-            r.get("adset_id") or "",
-            r.get("status") or "",
-            r.get("optimization_goal") or "",
-            (r.get("targeting_summary") or "")[:120],
-        ]
-        for r in rows
-    ]
-    return (
-        f"Found {len(rows)} ad set targeting row(s).\n"
-        + _table_lines(
-            ["Ad set", "ID", "Status", "Optimization", "Targeting"],
-            body,
-        )
-    )
-
-
-@mcp.tool()
-def get_reach_frequency(
-    start_date: str,
-    end_date: str = "",
-    by: str = "campaign",
-    campaign: str = "",
-    account_id: str = "",
-    limit: int = 25,
-) -> str:
-    """
-    Reach and frequency reporting (frequency caps / delivery pressure).
-
-    Note: reach is not additive across rows — totals are approximate when broken down.
-    """
-    key = (by or "campaign").strip().lower()
-    level_map = {
-        "account": ("account", "campaign_name"),
-        "campaign": ("campaign", "campaign_name"),
-        "adset": ("adset", "adset_name"),
-        "ad": ("ad", "ad_name"),
-    }
-    if key not in level_map:
-        return "Unknown level. Use by=account|campaign|adset|ad."
-    level, col = level_map[key]
-    if key == "account":
-        col = "account"
-
-    start, end = _date_range(start_date, end_date)
-    rows = _fetch_insights(
-        level=level if key != "account" else "account",
-        start=start,
-        end=end,
-        account_id=account_id,
-        campaign=campaign,
-        time_increment="all_days",
-    )
-    if campaign.strip() and not _fb().resolve_campaign_id(account_id, campaign):
-        rows = _filter_rows(rows, campaign=campaign)
-    if not rows:
-        return "No reach/frequency data in that range."
-
-    if key == "account":
-        for r in rows:
-            r["account"] = "Account total"
-
-    # Aggregate carefully: spend/impressions/clicks sum; reach/frequency use weighted avg.
-    buckets: dict[str, dict[str, float]] = defaultdict(
-        lambda: {
-            "amount_spent_usd": 0.0,
-            "impressions": 0.0,
-            "reach": 0.0,
-            "clicks_all": 0.0,
-            "purchases": 0.0,
-            "_freq_weight": 0.0,
-            "_freq_sum": 0.0,
-        }
-    )
-    for r in rows:
-        name = str(r.get(col) or "(unnamed)")
-        imps = float(r.get("impressions") or 0)
-        reach = float(r.get("reach") or 0)
-        freq = float(r.get("frequency") or 0)
-        buckets[name]["amount_spent_usd"] += float(r.get("amount_spent_usd") or 0)
-        buckets[name]["impressions"] += imps
-        buckets[name]["reach"] += reach
-        buckets[name]["clicks_all"] += float(r.get("clicks_all") or 0)
-        buckets[name]["purchases"] += float(r.get("purchases") or 0)
-        if freq > 0 and imps > 0:
-            buckets[name]["_freq_sum"] += freq * imps
-            buckets[name]["_freq_weight"] += imps
-
-    ranked = sorted(
-        buckets.items(),
-        key=lambda kv: kv[1]["impressions"],
-        reverse=True,
-    )[: max(1, min(limit, 100))]
-
-    table = []
-    for name, v in ranked:
-        imps = v["impressions"]
-        reach = v["reach"]
-        if v["_freq_weight"] > 0:
-            freq = v["_freq_sum"] / v["_freq_weight"]
-        elif reach > 0:
-            freq = imps / reach
-        else:
-            freq = 0.0
-        table.append(
-            [
-                name[:45],
-                _fmt_int(reach),
-                _fmt_float(freq, decimals=2),
-                _fmt_int(imps),
-                _fmt_usd(v["amount_spent_usd"]),
-                _fmt_int(v["purchases"]),
-            ]
-        )
-    return (
-        f"Reach & frequency by {key} (Graph API)\n"
-        f"{start.isoformat()} to {end.isoformat()}\n"
-        f"Note: reach is non-additive across rows when broken down.\n"
-        + _table_lines(
-            [key.title(), "Reach", "Frequency", "Impressions", "Spend", "Purchases"],
-            table,
-        )
-    )
-
-
-@mcp.tool()
-def get_multi_account_spend(
-    start_date: str = "yesterday",
+    start_date: str = "",
     end_date: str = "",
     limit: int = 100,
 ) -> str:
-    """Roll up spend across all accessible Ground Truth ad accounts for a date range."""
-    start, end = _date_range(start_date, end_date or start_date)
-    rows = _fb().list_accounts_with_spend(
-        start, end, account_limit=max(1, min(limit, 500))
-    )
+    """List campaigns (optionally filtered by account or name) with totals for a date range (default last 30 days)."""
+    start, end = _default_range(start_date, end_date)
+    rows = _gt().list_campaigns(start, end, account_id=account_id, search=search)
+    rows.sort(key=lambda r: metric(r, "spend"), reverse=True)
+    rows = rows[: _clamp(limit, 500)]
     if not rows:
-        return "No ad accounts returned."
-    with_spend = [r for r in rows if float(r.get("spend") or 0) > 0]
-    total = sum(float(r.get("spend") or 0) for r in rows)
+        return f"No campaigns matched for {_span(start, end)}."
     body = [
         [
-            r.get("account_id") or "",
-            (r.get("name") or "")[:35],
-            (r.get("parent_business_name") or "—")[:25],
-            _fmt_usd(r.get("spend")),
-            _fmt_int(r.get("impressions")),
-            _fmt_int(r.get("clicks")),
-            r.get("currency") or "",
+            r["campaign_id"],
+            str(r.get("campaign_name") or "")[:45],
+            str(r.get("account_name") or "")[:30],
+            _fmt_money(metric(r, "spend")),
+            _fmt_int(metric(r, "impressions")),
+            _fmt_int(metric(r, "clicks")),
+            _fmt_int(metric(r, "visits")),
         ]
         for r in rows
     ]
-    highest = with_spend[0] if with_spend else None
-    lowest = with_spend[-1] if with_spend else None
-    lines = [
-        f"Multi-account rollup (Graph API)",
-        f"{start.isoformat()} to {end.isoformat()}",
-        f"Accounts: {len(rows)} · With spend: {len(with_spend)} · Total spend: {_fmt_usd(total)}",
-    ]
-    if highest:
-        lines.append(
-            f"Highest: {highest.get('name')} ({highest.get('account_id')}) "
-            f"{_fmt_usd(highest.get('spend'))}"
-        )
-    if lowest and lowest is not highest:
-        lines.append(
-            f"Lowest (among spenders): {lowest.get('name')} ({lowest.get('account_id')}) "
-            f"{_fmt_usd(lowest.get('spend'))}"
-        )
-    lines.append(
-        _table_lines(
-            ["Account", "Name", "Parent", "Spend", "Impressions", "Clicks", "Currency"],
-            body,
+    return (
+        f"{len(rows)} campaign(s) · {_span(start, end)}\n"
+        + _table_lines(
+            ["Campaign ID", "Campaign", "Account", "Spend", "Impressions", "Clicks", "Visits"], body
         )
     )
+
+
+@mcp.tool()
+@_safe
+def get_org_summary(start_date: str = "", end_date: str = "", organization_id: str = "") -> str:
+    """Organization-wide KPI totals across all accounts and campaigns."""
+    start, end = _default_range(start_date, end_date)
+    rows = _gt().org_totals(start, end, organization_id)
+    if not rows:
+        return f"No org data for {_span(start, end)}."
+    t = _sum(rows)
+    accounts = {str(r.get("account_id")) for r in rows if r.get("account_id")}
+    lines = [
+        "GroundTruth organization summary",
+        f"Dates: {_span(start, end)}",
+        f"Accounts: {len(accounts)} · Campaigns: {len(rows)}",
+        f"Spend: {_fmt_money(t['spend'])}",
+        f"Impressions: {_fmt_int(t['impressions'])}",
+        f"Clicks: {_fmt_int(t['clicks'])}",
+        f"Visits: {_fmt_int(t['visits'])}",
+        f"Secondary actions: {_fmt_int(t['secondary_actions'])}",
+    ]
+    return "\n".join(lines + _derived(t))
+
+
+@mcp.tool()
+@_safe
+def get_account_summary(account_id: str = "", start_date: str = "", end_date: str = "", limit: int = 50) -> str:
+    """Account totals plus a per-campaign table (GroundTruth account totals report)."""
+    start, end = _default_range(start_date, end_date)
+    aid = account_id or _gt().default_account
+    rows = _gt().account_totals(aid, start, end)
+    if not rows:
+        return f"No data for account {aid} in {_span(start, end)}."
+    t = _sum(rows)
+    name = rows[0].get("account_name") or aid
+    lines = [
+        f"Account summary: {name} ({aid})",
+        f"Dates: {_span(start, end)}",
+        f"Spend: {_fmt_money(t['spend'])}",
+        f"Impressions: {_fmt_int(t['impressions'])}",
+        f"Clicks: {_fmt_int(t['clicks'])}",
+        f"Visits: {_fmt_int(t['visits'])}",
+        f"Secondary actions: {_fmt_int(t['secondary_actions'])}",
+        *_derived(t),
+    ]
+    if len(rows) > 1 or rows[0].get("campaign_name"):
+        lines.append("")
+        lines.append(
+            _group_table(
+                rows,
+                lambda r: f"{r.get('campaign_name') or ''} ({str(r.get('campaign_id') or '').split('.')[0]})",
+                header="Campaign",
+                limit=_clamp(limit, 200),
+                sort_by="spend",
+            )
+        )
     return "\n".join(lines)
+
+
+@mcp.tool()
+@_safe
+def get_campaign_summary(campaign: str, start_date: str = "", end_date: str = "", account_id: str = "") -> str:
+    """KPI totals for one campaign (id or name): spend, impressions, clicks, visits, reach, video, conversions."""
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = _gt().campaign_totals(cid, start, end)
+    if not rows:
+        return f"No data for campaign {cid} in {_span(start, end)}."
+    r0 = rows[0]
+    t = _sum(rows, _CORE + ("reach", "video_completes", "conversions", "projected_visits"))
+    lines = [
+        f"Campaign: {r0.get('campaign_name') or cid} ({cid})",
+        f"Account: {r0.get('account_name') or '—'}",
+        f"Dates: {_span(start, end)}",
+        f"Spend: {_fmt_money(t['spend'])}",
+        f"Impressions: {_fmt_int(t['impressions'])}",
+        f"Reach: {_fmt_int(t['reach'])}",
+        f"Clicks: {_fmt_int(t['clicks'])}",
+        f"Visits: {_fmt_int(t['visits'])} (projected {_fmt_int(t['projected_visits'])})",
+        f"Secondary actions: {_fmt_int(t['secondary_actions'])}",
+    ]
+    if t["video_completes"]:
+        lines.append(f"Video completes: {_fmt_int(t['video_completes'])}")
+    if t["conversions"]:
+        lines.append(f"Conversions: {_fmt_int(t['conversions'])}")
+    for key, label in (
+        ("click_to_call", "Click-to-call"),
+        ("directions", "Directions"),
+        ("website", "Website"),
+        ("moreinfo", "More info"),
+        ("coupon", "Coupon"),
+    ):
+        v = sum(metric(r, key) for r in rows)
+        if v:
+            lines.append(f"{label}: {_fmt_int(v)}")
+    return "\n".join(lines + _derived(t))
+
+
+@mcp.tool()
+@_safe
+def get_daily_trend(campaign: str, start_date: str = "", end_date: str = "", account_id: str = "") -> str:
+    """Day-by-day spend, impressions, clicks, and visits for a campaign."""
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = _gt().campaign_daily(cid, start, end)
+    daily: dict[str, dict[str, float]] = defaultdict(lambda: {m: 0.0 for m in _CORE})
+    for r in rows:
+        d = str(r.get("date") or "")[:10]
+        if not d:
+            continue
+        for m in _CORE:
+            daily[d][m] += metric(r, m)
+    if not daily:
+        return f"No daily data for campaign {cid} in {_span(start, end)}."
+    body = [
+        [d, _fmt_money(v["spend"]), _fmt_int(v["impressions"]), _fmt_int(v["clicks"]), _fmt_int(v["visits"])]
+        for d, v in sorted(daily.items())
+    ]
+    return (
+        f"Daily trend · campaign {cid} · {_span(start, end)}\n"
+        + _table_lines(["Date", "Spend", "Impressions", "Clicks", "Visits"], body)
+    )
+
+
+@mcp.tool()
+@_safe
+def get_adgroup_performance(
+    campaign: str, start_date: str = "", end_date: str = "", account_id: str = "", limit: int = 50
+) -> str:
+    """Totals for every ad group in a campaign, ranked by spend."""
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = [r for r in _gt().campaign_totals(cid, start, end, by="adgroup") if r.get("adgroup_id")]
+    if not rows:
+        return f"No ad group data for campaign {cid} in {_span(start, end)}."
+    return f"Ad groups · campaign {cid} · {_span(start, end)}\n" + _group_table(
+        rows,
+        lambda r: f"{r.get('adgroup_name') or ''} ({str(r.get('adgroup_id')).split('.')[0]})",
+        header="Ad group",
+        limit=_clamp(limit, 200),
+        sort_by="spend",
+    )
+
+
+@mcp.tool()
+@_safe
+def get_creative_performance(
+    campaign: str,
+    start_date: str = "",
+    end_date: str = "",
+    account_id: str = "",
+    sort_by: str = "impressions",
+    limit: int = 25,
+) -> str:
+    """Top creatives in a campaign ranked by impressions, clicks, spend, or visits."""
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = [r for r in _gt().campaign_totals(cid, start, end, by="creative") if r.get("creative_id")]
+    if not rows:
+        rows = _gt().creatives_daily(cid, start, end)
+    if not rows:
+        return f"No creative data for campaign {cid} in {_span(start, end)}."
+    key = sort_by if sort_by in ("impressions", "clicks", "spend", "visits") else "impressions"
+    return f"Creatives by {key} · campaign {cid} · {_span(start, end)}\n" + _group_table(
+        rows,
+        lambda r: f"{r.get('creative_name') or ''} ({str(r.get('creative_id')).split('.')[0]})",
+        header="Creative",
+        limit=_clamp(limit, 100),
+        sort_by=key,
+    )
+
+
+@mcp.tool()
+@_safe
+def get_location_breakdown(
+    campaign: str,
+    location_type: str = "state",
+    start_date: str = "",
+    end_date: str = "",
+    account_id: str = "",
+    sort_by: str = "impressions",
+    limit: int = 50,
+) -> str:
+    """Campaign performance by geography: location_type = state | dma | zipcode | county."""
+    lt = (location_type or "state").strip().lower()
+    lt = {"zip": "zipcode", "zip_code": "zipcode", "region": "state", "states": "state"}.get(lt, lt)
+    if lt not in ("state", "dma", "zipcode", "county"):
+        return "Unknown location_type. Use state | dma | zipcode | county."
+    sort_key = sort_by if sort_by in ("impressions", "clicks", "ctr", "secondary_actions", "visits") else "impressions"
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = _gt().campaign_locations(cid, start, end, location_type=lt, sort_metric=sort_key)
+    if not rows:
+        return f"No {lt} data for campaign {cid} in {_span(start, end)}."
+    field = {"state": "state", "dma": "dma", "zipcode": "zip", "county": "county"}[lt]
+
+    def label(r):
+        v = r.get(field) or r.get(lt)
+        if lt == "zipcode" and r.get("city"):
+            return f"{v} ({r.get('city')}, {r.get('state') or ''})"
+        return v
+
+    return f"Campaign {cid} by {lt} · {_span(start, end)}\n" + _group_table(
+        rows,
+        label,
+        header=lt.title(),
+        limit=_clamp(limit, 500),
+        sort_by="impressions" if sort_key == "ctr" else sort_key,
+        metrics=("impressions", "clicks", "ctr_calc", "spend", "visits", "secondary_actions"),
+    )
+
+
+@mcp.tool()
+@_safe
+def get_demographics_breakdown(
+    campaign: str, by: str = "age_gender", start_date: str = "", end_date: str = "", account_id: str = ""
+) -> str:
+    """Campaign performance by age, gender, or age × gender."""
+    key = (by or "age_gender").strip().lower().replace("-", "_").replace(" ", "_")
+    key = {"demographics": "age_gender", "demo": "age_gender", "agegender": "age_gender"}.get(key, key)
+    if key not in ("age", "gender", "age_gender"):
+        return "Unknown demographic. Use by=age | gender | age_gender."
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = _gt().campaign_demographic(cid, start, end, by=key)
+    if not rows:
+        return f"No demographic data for campaign {cid} in {_span(start, end)}."
+
+    def label(r):
+        if key == "age_gender":
+            return f"{r.get('age') or '?'} / {r.get('gender') or '?'}"
+        return r.get(key)
+
+    return f"Campaign {cid} by {key.replace('_', ' × ')} · {_span(start, end)}\n" + _group_table(
+        rows,
+        label,
+        header=key.replace("_", " × ").title(),
+        limit=200,
+        metrics=("impressions", "clicks", "ctr_calc", "spend", "secondary_actions"),
+    )
+
+
+@mcp.tool()
+@_safe
+def get_device_breakdown(campaign: str, start_date: str = "", end_date: str = "", account_id: str = "") -> str:
+    """Campaign performance by device / publisher type (app, web, CTV …)."""
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = _gt().campaign_device_type(cid, start, end)
+    if not rows:
+        return f"No device data for campaign {cid} in {_span(start, end)}."
+    return f"Campaign {cid} by device type · {_span(start, end)}\n" + _group_table(
+        rows,
+        lambda r: r.get("pub_type"),
+        header="Device type",
+        limit=50,
+        metrics=("impressions", "clicks", "ctr_calc", "spend"),
+    )
+
+
+@mcp.tool()
+@_safe
+def get_hourly_performance(
+    campaign: str, start_date: str = "", end_date: str = "", account_id: str = "", level: str = "campaign"
+) -> str:
+    """Time-of-day (hour 0–23) performance for a campaign; level = campaign | adgroup | creative."""
+    lvl = level if level in ("campaign", "adgroup", "creative") else "campaign"
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = _gt().campaign_time_of_day(cid, start, end, level=lvl)
+    if not rows:
+        return f"No time-of-day data for campaign {cid} in {_span(start, end)}."
+    hours: dict[int, dict[str, float]] = defaultdict(lambda: {m: 0.0 for m in _CORE})
+    for r in rows:
+        try:
+            h = int(float(r.get("hr")))
+        except (TypeError, ValueError):
+            continue
+        for m in _CORE:
+            hours[h][m] += metric(r, m)
+    body = [
+        [
+            f"{h:02d}:00",
+            _fmt_int(v["impressions"]),
+            _fmt_int(v["clicks"]),
+            _fmt_pct(v["clicks"] / v["impressions"] * 100) if v["impressions"] else "—",
+            _fmt_int(v["visits"]),
+            _fmt_int(v["secondary_actions"]),
+        ]
+        for h, v in sorted(hours.items())
+    ]
+    return (
+        f"Time of day · campaign {cid} · {_span(start, end)}\n"
+        + _table_lines(["Hour", "Impressions", "Clicks", "CTR", "Visits", "Sec. actions"], body)
+    )
+
+
+_DIMENSIONS = {
+    "behavioral_audience": ("behavioral_audience", lambda r: r.get("a_name") or r.get("a_id"), "Audience"),
+    "audience": ("behavioral_audience", lambda r: r.get("a_name") or r.get("a_id"), "Audience"),
+    "category": ("category", lambda r: r.get("c_name") or r.get("sic"), "Category"),
+    "brand_affinity": ("brand_affinity", lambda r: r.get("b_name") or r.get("b_id"), "Brand"),
+    "brand": ("brand_affinity", lambda r: r.get("b_name") or r.get("b_id"), "Brand"),
+    "publisher": ("publisher", lambda r: r.get("publisher_name"), "Publisher"),
+    "network": ("network", lambda r: r.get("network_name"), "Network"),
+    "streaming_genre": ("audio/streaming_genre", lambda r: r.get("genre") or r.get("streaming_genre"), "Genre"),
+    "podcast_topic": ("audio/podcast_topic", lambda r: r.get("topic"), "Podcast topic"),
+    "podcast_series": ("audio/podcast_series", lambda r: r.get("series"), "Podcast series"),
+    "audio_publisher": ("audio/publisher", lambda r: r.get("app_site_publisher_name"), "Audio publisher"),
+}
+
+
+@mcp.tool()
+@_safe
+def get_dimension_breakdown(
+    campaign: str,
+    dimension: str,
+    start_date: str = "",
+    end_date: str = "",
+    account_id: str = "",
+    level: str = "campaign",
+    limit: int = 50,
+) -> str:
+    """
+    Campaign breakdown by audience / inventory dimension.
+
+    dimension = behavioral_audience | category | brand_affinity | publisher | network |
+    streaming_genre | podcast_topic | podcast_series | audio_publisher.
+    level = campaign | adgroup | creative (not every dimension supports every level).
+    """
+    spec = _DIMENSIONS.get((dimension or "").strip().lower())
+    if not spec:
+        return "Unknown dimension. Use: " + " | ".join(sorted(k for k in _DIMENSIONS if k not in ("audience", "brand")))
+    path_dim, label_fn, header = spec
+    lvl = level if level in ("campaign", "adgroup", "creative") else "campaign"
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = _gt().campaign_dimension(path_dim, cid, start, end, level=lvl)
+    if not rows:
+        return f"No {header.lower()} data for campaign {cid} in {_span(start, end)}."
+    if lvl != "campaign":
+        name_key = "adgroup_name" if lvl == "adgroup" else "creative_name"
+        base = label_fn
+        label_fn = lambda r: f"{base(r)} · {r.get(name_key) or ''}"  # noqa: E731
+    return f"Campaign {cid} by {header.lower()} · {_span(start, end)}\n" + _group_table(
+        rows,
+        label_fn,
+        header=header,
+        limit=_clamp(limit, 500),
+        metrics=("impressions", "clicks", "ctr_calc", "visits", "secondary_actions"),
+    )
+
+
+@mcp.tool()
+@_safe
+def get_poi_performance(
+    campaign: str,
+    start_date: str = "",
+    end_date: str = "",
+    account_id: str = "",
+    sort_by: str = "visits",
+    limit: int = 50,
+) -> str:
+    """Store-visit performance by point of interest (POI / product / store location) for a campaign."""
+    start, end = _default_range(start_date, end_date)
+    cid = _campaign(campaign, account_id)
+    rows = _gt().campaign_dimension("product", cid, start, end)
+    if not rows:
+        return f"No POI data for campaign {cid} in {_span(start, end)}."
+
+    def label(r):
+        poi = r.get("poi_name") or r.get("product") or "(unknown)"
+        where = ", ".join(str(x) for x in (r.get("city"), r.get("state")) if x)
+        return f"{poi} — {where}" if where else poi
+
+    key = sort_by if sort_by in ("impressions", "clicks", "visits", "secondary_actions") else "visits"
+    return f"POI / store visits · campaign {cid} · {_span(start, end)}\n" + _group_table(
+        rows,
+        label,
+        header="POI",
+        limit=_clamp(limit, 500),
+        sort_by=key,
+        metrics=("impressions", "clicks", "ctr_calc", "visits", "secondary_actions"),
+    )
+
+
+@mcp.tool()
+@_safe
+def get_conversion_tracking(account_id: str = "", start_date: str = "", end_date: str = "", limit: int = 100) -> str:
+    """Conversion tracking results for every ad group under an account."""
+    start, end = _default_range(start_date, end_date)
+    aid = account_id or _gt().default_account
+    rows = _gt().conversion_tracking(aid, start, end)
+    if not rows:
+        return f"No conversion tracking data for account {aid} in {_span(start, end)}."
+    keys = [k for k in rows[0].keys()][:10]
+    body = [[str(r.get(k, ""))[:40] for k in keys] for r in rows[: _clamp(limit, 500)]]
+    return f"Conversion tracking · account {aid} · {_span(start, end)}\n" + _table_lines(keys, body)
+
+
+@mcp.tool()
+@_safe
+def raw_report(path: str, start_date: str = "", end_date: str = "", extra_params: str = "") -> str:
+    """
+    Call any GroundTruth Reporting API GET endpoint under /demand/ and return JSON.
+
+    Use for endpoints without a dedicated tool, e.g.
+    path="/demand/v1/adgroup/123/daily" or "/demand/v2/campaign/sv_locations/456".
+    extra_params: query string like "all_creatives=1&location_type=dma".
+    """
+    import json
+    from urllib.parse import parse_qsl
+
+    params: dict[str, Any] = dict(parse_qsl(extra_params or ""))
+    if start_date or end_date:
+        start, end = _date_range(start_date or end_date, end_date)
+        params["start_date"] = _gt().fmt_date(start)
+        params["end_date"] = _gt().fmt_date(end)
+    data = _gt().get(path, params)
+    text = json.dumps(data, indent=1, default=str)
+    if len(text) > 40000:
+        text = text[:40000] + "\n… (truncated)"
+    return text
 
 
 def _cors_headers() -> dict[str, str]:
@@ -1407,17 +1037,17 @@ async def health_check(request):
     from starlette.responses import JSONResponse
 
     oauth_ready = bool(MCP_PUBLIC_URL)
-    has_jwt_secret = bool(
-        os.environ.get("MCP_OAUTH_JWT_SECRET", "").strip()
-        or os.environ.get("GROUND_TRUTH_APP_SECRET", "").strip()
-    )
     return JSONResponse(
         {
             "status": "ok",
             "service": "ground-truth",
             "oauth_enabled": oauth_ready,
             "oauth_token_mode": "signed_stateless",
-            "oauth_sessions_survive_deploys": has_jwt_secret,
+            "oauth_clients_mode": "signed_stateless",
+            "mcp_transport": "streamable-http (stateless)",
+            "oauth_sessions_survive_deploys": bool(
+                os.environ.get("MCP_OAUTH_JWT_SECRET", "").strip()
+            ),
             "public_url": MCP_PUBLIC_URL or None,
             "mcp_url": MCP_RESOURCE_URL or None,
             "oauth_discovery": (
@@ -1431,132 +1061,6 @@ async def health_check(request):
                 else None
             ),
         }
-    )
-
-
-@mcp.custom_route("/api/account-spend", methods=["GET", "OPTIONS"])
-async def api_account_spend(request):
-    """JSON endpoint for account-spend.html — spend per ad account for a date."""
-    from starlette.responses import JSONResponse, Response
-
-    if request.method == "OPTIONS":
-        return Response(status_code=204, headers=_cors_headers())
-
-    raw_date = (request.query_params.get("date") or "").strip()
-    if raw_date:
-        try:
-            report_date = _parse_date(raw_date)
-        except ValueError as e:
-            return JSONResponse(
-                {"error": str(e), "accounts": []},
-                status_code=400,
-                headers=_cors_headers(),
-            )
-    else:
-        report_date = date.today() - timedelta(days=1)
-
-    try:
-        limit = int(request.query_params.get("limit", "100"))
-    except ValueError:
-        limit = 100
-    limit = max(1, min(limit, 500))
-
-    try:
-        _ensure_fb()
-        rows = _fb().list_accounts_with_spend(
-            report_date, report_date, account_limit=limit
-        )
-        with_spend = [r for r in rows if float(r.get("spend") or 0) > 0]
-        total_spend = round(sum(float(r.get("spend") or 0) for r in rows), 2)
-        highest = with_spend[0] if with_spend else None
-        lowest = with_spend[-1] if with_spend else None
-        return JSONResponse(
-            {
-                "date": report_date.isoformat(),
-                "account_count": len(rows),
-                "accounts_with_spend": len(with_spend),
-                "total_spend": total_spend,
-                "highest": highest,
-                "lowest": lowest,
-                "accounts": rows,
-            },
-            headers=_cors_headers(),
-        )
-    except (MetaGraphError, RuntimeError, ValueError) as e:
-        return JSONResponse(
-            {"error": str(e), "accounts": []},
-            status_code=500,
-            headers=_cors_headers(),
-        )
-
-
-@mcp.custom_route("/account-spend", methods=["GET"])
-async def account_spend_page(request):
-    """Serve account-spend.html from the connector."""
-    from starlette.responses import FileResponse
-
-    return FileResponse(
-        os.path.join(_SCRIPT_DIR, "account-spend.html"),
-        media_type="text/html",
-    )
-
-
-@mcp.custom_route("/api/accounts", methods=["GET", "OPTIONS"])
-async def api_list_accounts(request):
-    """JSON endpoint for test-accounts.html (local HTTP mode)."""
-    from starlette.responses import JSONResponse, Response
-
-    if request.method == "OPTIONS":
-        return Response(status_code=204, headers=_cors_headers())
-
-    try:
-        limit = int(request.query_params.get("limit", "100"))
-    except ValueError:
-        limit = 100
-    limit = max(1, min(limit, 500))
-    try:
-        _ensure_fb()
-        rows = _fb().list_all_ad_accounts(limit=limit)
-        return JSONResponse(
-            {
-                "count": len(rows),
-                "accounts": [
-                    {
-                        **row,
-                        "account_id": f"act_{row.get('account_id', '')}",
-                    }
-                    for row in rows
-                ],
-            },
-            headers=_cors_headers(),
-        )
-    except (MetaGraphError, RuntimeError, ValueError) as e:
-        return JSONResponse(
-            {"error": str(e), "accounts": []},
-            status_code=500,
-            headers=_cors_headers(),
-        )
-
-
-@mcp.custom_route("/test-accounts", methods=["GET"])
-async def test_accounts_page(request):
-    """Serve test-accounts.html from the connector (avoids file:// CORS issues)."""
-    from starlette.responses import FileResponse
-
-    return FileResponse(
-        os.path.join(_SCRIPT_DIR, "test-accounts.html"),
-        media_type="text/html",
-    )
-
-
-@mcp.custom_route("/get-token", methods=["GET"])
-async def get_token_page(request):
-    """Serve get-token.html from the connector."""
-    from starlette.responses import FileResponse
-
-    return FileResponse(
-        os.path.join(_SCRIPT_DIR, "get-token.html"),
-        media_type="text/html",
     )
 
 
@@ -1577,24 +1081,30 @@ if __name__ == "__main__":
     default_port = int(os.environ.get("PORT", "8080" if on_cloud else "8001"))
 
     parser = argparse.ArgumentParser(
-        description="Ground Truth MCP connector (Facebook Graph API)."
+        description="Ground Truth MCP connector (GroundTruth Reporting API)."
     )
     parser.add_argument("--http", action="store_true", default=default_http)
     parser.add_argument("--host", default=default_host)
     parser.add_argument("--port", type=int, default=default_port)
     args = parser.parse_args()
 
-    print("Ground Truth MCP → Facebook Graph API", file=sys.stderr, flush=True)
+    print("Ground Truth MCP → GroundTruth Reporting API", file=sys.stderr, flush=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
-    # httpx logs full request URLs (including tokens) at INFO — keep those quiet.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     if MCP_PUBLIC_URL:
         print(f"OAuth for Claude: enabled (issuer={MCP_PUBLIC_URL})", file=sys.stderr, flush=True)
+        if not os.environ.get("MCP_OAUTH_JWT_SECRET", "").strip():
+            print(
+                "WARNING: MCP_OAUTH_JWT_SECRET not set — Claude will be asked to reconnect "
+                "whenever GROUND_TRUTH_API_KEY changes.",
+                file=sys.stderr,
+                flush=True,
+            )
     elif on_cloud:
         print(
             "WARNING: MCP_PUBLIC_URL not set — Claude OAuth DCR is disabled. "
@@ -1603,54 +1113,54 @@ if __name__ == "__main__":
             flush=True,
         )
     try:
-        _ensure_fb()
-        print("Facebook app credentials loaded.", file=sys.stderr, flush=True)
-    except (RuntimeError, MetaGraphError) as e:
+        _gt().validate_config()
+        print("GroundTruth credentials loaded.", file=sys.stderr, flush=True)
+    except RuntimeError as e:
         # Do not crash the process — OAuth /health must stay up for Claude register.
-        print(f"WARNING: Facebook credentials not ready: {e}", file=sys.stderr, flush=True)
+        print(f"WARNING: {e}", file=sys.stderr, flush=True)
 
     tools = [
-        "help_meta",
+        "help_ground_truth",
+        "get_integration_status",
         "list_accounts",
         "list_campaigns",
-        "list_adsets",
-        "list_creatives",
-        "get_integration_status",
-        "get_ads_summary",
+        "get_org_summary",
+        "get_account_summary",
+        "get_campaign_summary",
         "get_daily_trend",
-        "get_hourly_performance",
-        "get_performance_breakdown",
+        "get_adgroup_performance",
+        "get_creative_performance",
+        "get_location_breakdown",
         "get_demographics_breakdown",
-        "get_conversions_by_region",
-        "get_reach_frequency",
-        "get_top_ads",
-        "get_campaign_budgets",
-        "set_object_status",
-        "get_adset_targeting",
-        "get_multi_account_spend",
+        "get_device_breakdown",
+        "get_hourly_performance",
+        "get_dimension_breakdown",
+        "get_poi_performance",
+        "get_conversion_tracking",
+        "raw_report",
     ]
     print("Tools: " + ", ".join(tools), file=sys.stderr, flush=True)
 
     try:
         if args.http:
-            endpoint = f"http://{args.host}:{args.port}/mcp"
-            public = f"{MCP_PUBLIC_URL}/mcp" if MCP_PUBLIC_URL else endpoint
+            public = f"{MCP_PUBLIC_URL}/mcp" if MCP_PUBLIC_URL else f"http://{args.host}:{args.port}/mcp"
             print(
-                f"\nHTTP mode\n"
-                f"  MCP endpoint: {public}\n"
-                f"  Account spend: http://{args.host}:{args.port}/account-spend\n"
-                f"  Test page:     http://{args.host}:{args.port}/test-accounts\n"
-                f"  Test API:      http://{args.host}:{args.port}/api/accounts\n"
-                f"  Stop: Ctrl+C\n",
+                f"\nHTTP mode (stateless)\n  MCP endpoint: {public}\n  Stop: Ctrl+C\n",
                 file=sys.stderr,
                 flush=True,
             )
             from mcp.server.transport_security import TransportSecuritySettings
 
+            # stateless_http: no server-side MCP session ids, so Cloud Run restarts,
+            # redeploys, and instance swaps never invalidate Claude's connection.
+            # json_response: plain JSON replies instead of long-lived SSE streams that
+            # Cloud Run's request timeout would cut off.
             mcp.run(
                 transport="streamable-http",
                 host=args.host,
                 port=args.port,
+                stateless_http=True,
+                json_response=True,
                 transport_security=TransportSecuritySettings(
                     enable_dns_rebinding_protection=False
                 ),

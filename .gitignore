@@ -29,6 +29,11 @@ _fetch_*.py
 _yesterday_*.py
 _account_*.py
 
+# Local server logs
+server.log
+server.out
+*.log
+
 # OAuth session persistence (Claude connector tokens)
 .ground-truth-oauth-state.json
 .ground-truth-oauth-state.json.tmp

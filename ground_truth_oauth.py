@@ -4,9 +4,9 @@ Claude.ai-compatible OAuth 2.1 provider for the Ground Truth MCP connector.
 Claude custom connectors require Dynamic Client Registration (DCR) and
 discovery at /.well-known/oauth-authorization-server.
 
-Access + refresh tokens are **HMAC-signed (stateless)**. They survive Cloud Run
-deploys and cold starts without /tmp or GCS — this fixes Claude "Your session
-has expired" that DV360/Reddit avoid when their instances keep memory.
+Access tokens, refresh tokens, AND dynamically registered client ids are
+**HMAC-signed (stateless)**. Nothing Claude holds depends on server memory, so
+Cloud Run deploys, restarts, and cold starts never force a reconnect.
 
 Refresh tokens are NOT rotated (same token returned on refresh).
 """
@@ -43,7 +43,8 @@ logger = logging.getLogger("ground-truth-oauth")
 
 DEFAULT_SCOPE = "ground-truth"
 DEFAULT_ACCESS_TOKEN_EXPIRY = 90 * 24 * 60 * 60  # 90 days
-DEFAULT_REFRESH_TOKEN_EXPIRY = 365 * 24 * 60 * 60  # 1 year
+DEFAULT_REFRESH_TOKEN_EXPIRY = 10 * 365 * 24 * 60 * 60  # 10 years
+SIGNED_CLIENT_PREFIX = "gtc_"
 DEFAULT_ALLOWED_REDIRECT_DOMAINS = ("claude.ai", "claude.com", "localhost", "127.0.0.1")
 
 CLAUDE_CIMD_URLS = (
@@ -67,14 +68,14 @@ def _resolve_signing_secret() -> str:
     """
     Stable secret across Cloud Run revisions (must not change or all sessions die).
 
-    Prefer MCP_OAUTH_JWT_SECRET; fall back to GROUND_TRUTH_APP_SECRET (already in
+    Prefer MCP_OAUTH_JWT_SECRET; fall back to GROUND_TRUTH_API_KEY (already in
     Secret Manager on Cloud Run).
     """
-    for key in ("MCP_OAUTH_JWT_SECRET", "GROUND_TRUTH_APP_SECRET"):
+    for key in ("MCP_OAUTH_JWT_SECRET", "GROUND_TRUTH_API_KEY"):
         val = os.environ.get(key, "").strip()
         if val:
             return val
-    # Local-only fallback — Cloud Run must have GROUND_TRUTH_APP_SECRET.
+    # Local-only fallback — Cloud Run must have MCP_OAUTH_JWT_SECRET.
     return "ground-truth-mcp-dev-insecure-change-me"
 
 
@@ -114,8 +115,8 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
             "MCP_OAUTH_JWT_SECRET"
             if os.environ.get("MCP_OAUTH_JWT_SECRET", "").strip()
             else (
-                "GROUND_TRUTH_APP_SECRET"
-                if os.environ.get("GROUND_TRUTH_APP_SECRET", "").strip()
+                "GROUND_TRUTH_API_KEY"
+                if os.environ.get("GROUND_TRUTH_API_KEY", "").strip()
                 else "insecure-dev-fallback"
             ),
         )
@@ -221,7 +222,29 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
         existing = self.clients.get(client_id)
         if existing:
             return existing
+        if client_id.startswith(SIGNED_CLIENT_PREFIX):
+            return self._decode_signed_client(client_id)
         return await self._ensure_cimd_client(client_id)
+
+    def _decode_signed_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        """Rebuild a DCR client from its signed client_id (survives restarts)."""
+        data = self._verify_payload(client_id[len(SIGNED_CLIENT_PREFIX):])
+        if not data or data.get("typ") != "client":
+            return None
+        redirect_uris = [u for u in (data.get("ru") or []) if self._is_redirect_allowed(u)]
+        if not redirect_uris:
+            return None
+        client_info = OAuthClientInformationFull(
+            client_id=client_id,
+            client_name=data.get("n") or "Claude",
+            redirect_uris=redirect_uris,
+            grant_types=data.get("gt") or ["authorization_code", "refresh_token"],
+            response_types=["code"],
+            token_endpoint_auth_method="none",
+            scope=data.get("s") or self.scope,
+        )
+        self.clients[client_id] = client_info
+        return client_info
 
     async def _ensure_cimd_client(self, client_id: str) -> OAuthClientInformationFull | None:
         """Accept Claude CIMD client_ids without a prior /register call."""
@@ -276,6 +299,23 @@ class ClaudeOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Re
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if not client_info.client_id:
             raise ValueError("No client_id provided")
+        # The SDK returns this same object to the client after we return, so
+        # swapping in a signed id makes the registration self-describing: any
+        # instance (including one started after a redeploy) can verify it.
+        if (
+            not client_info.client_id.startswith("https://")
+            and client_info.token_endpoint_auth_method == "none"
+        ):
+            signed = self._sign_payload(
+                {
+                    "typ": "client",
+                    "ru": [str(u) for u in (client_info.redirect_uris or [])],
+                    "gt": list(client_info.grant_types or []),
+                    "n": client_info.client_name or "Claude",
+                    "s": client_info.scope or self.scope,
+                }
+            )
+            client_info.client_id = f"{SIGNED_CLIENT_PREFIX}{signed}"
         self.clients[client_info.client_id] = client_info
         logger.info("Registered OAuth client %s", client_info.client_id)
 

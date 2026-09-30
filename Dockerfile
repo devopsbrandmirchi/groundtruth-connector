@@ -14,10 +14,9 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY ground_truth_mcp_server.py ground_truth_oauth.py ground_truth_api.py ./
-COPY account-spend.html get-token.html test-accounts.html ./
 
-# Facebook credentials injected at runtime (Secret Manager on Cloud Run).
-# GROUND_TRUTH_APP_ID, GROUND_TRUTH_APP_SECRET, GROUND_TRUTH_AD_ACCOUNT_ID
+# GroundTruth credentials injected at runtime (Secret Manager on Cloud Run).
+# GROUND_TRUTH_USER_ID, GROUND_TRUTH_API_KEY, GROUND_TRUTH_ORG_ID, MCP_OAUTH_JWT_SECRET
 # MCP_PUBLIC_URL must be set to the Cloud Run service URL for Claude OAuth.
 
 EXPOSE 8080
