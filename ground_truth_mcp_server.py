@@ -737,22 +737,82 @@ def get_creative_performance(
     account_id: str = "",
     sort_by: str = "impressions",
     limit: int = 25,
+    group_by: str = "asset",
 ) -> str:
-    """Top creatives in a campaign ranked by impressions, clicks, spend, or visits."""
+    """
+    Creatives in a campaign with image URL, size, ad groups, and performance, ranked by
+    impressions, clicks, spend, or visits. group_by = asset (one row per image, combining
+    copies across ad groups) | creative (one row per creative id / ad group).
+    Landing-page (click-through) URLs are not exposed by the GroundTruth Reporting API.
+    """
     start, end = _default_range(start_date, end_date)
     cid = _campaign(campaign, account_id)
-    rows = [r for r in _gt().campaign_totals(cid, start, end, by="creative") if r.get("creative_id")]
-    if not rows:
-        rows = _gt().creatives_daily(cid, start, end)
-    if not rows:
-        return f"No creative data for campaign {cid} in {_span(start, end)}."
     key = sort_by if sort_by in ("impressions", "clicks", "spend", "visits") else "impressions"
-    return f"Creatives by {key} · campaign {cid} · {_span(start, end)}\n" + _group_table(
-        rows,
-        lambda r: f"{r.get('creative_name') or ''} ({str(r.get('creative_id')).split('.')[0]})",
-        header="Creative",
-        limit=_clamp(limit, 100),
-        sort_by=key,
+    per_creative = (group_by or "").strip().lower() in ("creative", "creative_id", "id")
+
+    rows = [r for r in _gt().creatives_daily(cid, start, end) if r.get("creative_id")]
+    if not rows:
+        rows = [r for r in _gt().campaign_totals(cid, start, end, by="creative") if r.get("creative_id")]
+        if not rows:
+            return f"No creative data for campaign {cid} in {_span(start, end)}."
+        return f"Creatives by {key} · campaign {cid} · {_span(start, end)}\n" + _group_table(
+            rows,
+            lambda r: f"{r.get('creative_name') or ''} ({str(r.get('creative_id')).split('.')[0]})",
+            header="Creative",
+            limit=_clamp(limit, 100),
+            sort_by=key,
+        )
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        crid = str(r.get("creative_id")).split(".")[0]
+        url = str(r.get("creative_url") or "")
+        bkey = crid if per_creative else (url or crid)
+        b = buckets.setdefault(
+            bkey,
+            {
+                "name": r.get("creative_name") or "",
+                "size": r.get("creative_size") or "",
+                "url": url,
+                "ids": set(),
+                "adgroups": set(),
+                **{m: 0.0 for m in _CORE},
+            },
+        )
+        b["ids"].add(crid)
+        if r.get("adgroup_name"):
+            b["adgroups"].add(str(r["adgroup_name"]))
+        for m in _CORE:
+            b[m] += metric(r, m)
+
+    ranked = sorted(buckets.values(), key=lambda b: b.get(key, 0), reverse=True)[: _clamp(limit, 100)]
+    body = []
+    for b in ranked:
+        ids = sorted(b["ids"])
+        label = f"{b['name'][:50]} ({ids[0]})" if len(ids) == 1 else f"{b['name'][:50]} ({len(ids)} ids)"
+        adgroups = sorted(b["adgroups"])
+        ag = ", ".join(adgroups) if len(adgroups) <= 3 else f"{len(adgroups)} ad groups"
+        body.append(
+            [
+                label,
+                b["size"] or "—",
+                ag or "—",
+                _fmt_int(b["impressions"]),
+                _fmt_int(b["clicks"]),
+                _fmt_pct(b["clicks"] / b["impressions"] * 100) if b["impressions"] else "—",
+                _fmt_money(b["spend"]),
+                _fmt_int(b["visits"]),
+                b["url"] or "—",
+            ]
+        )
+    unit = "creative" if per_creative else "creative asset"
+    return (
+        f"{len(buckets)} {unit}(s) by {key} · campaign {cid} · {_span(start, end)}\n"
+        + _table_lines(
+            ["Creative", "Size", "Ad groups", "Impressions", "Clicks", "CTR", "Spend", "Visits", "Image URL"],
+            body,
+        )
+        + "\nLanding-page (click-through) URLs are not available from the GroundTruth Reporting API."
     )
 
 
