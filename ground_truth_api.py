@@ -9,6 +9,10 @@ https://reporting.groundtruth.com). Every request needs BOTH headers:
 
 Credentials are issued by GroundTruth support on request (not self-serve).
 The API only answers over HTTP/1.1 (httpx default).
+
+Every report endpoint rejects date ranges longer than 7 days (HTTP 401 with a
+"maximum of 7 days" message), so longer ranges are split into 7-day windows
+and the rows merged back together.
 """
 
 from __future__ import annotations
@@ -17,7 +21,8 @@ import logging
 import os
 import threading
 import time
-from datetime import date, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 import httpx
@@ -28,6 +33,34 @@ DEFAULT_BASE_URL = "https://reporting.groundtruth.com"
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 3
 ORG_CACHE_TTL_SECONDS = 600
+DEFAULT_MAX_RANGE_DAYS = 7
+MAX_CHUNKS = 54
+CHUNK_WORKERS = 4
+NAME_LOOKUP_WEEKS = 8
+
+# Counts that add up across date windows.
+_ADDITIVE_FIELDS = {
+    "impressions", "imp", "clicks", "clks", "spend", "spt",
+    "visits", "vst", "open_hour_visits", "oh_vst", "projected_visits", "prj_vst",
+    "projected_open_hour_visits", "sum_of_adgroup_visits", "sum_of_adgroup_open_hour_visits",
+    "projected_sum_of_adgroup_visits", "projected_sum_of_adgroup_open_hour_visits",
+    "total_attributed_visits", "visitors", "oh_visitors",
+    "total_sa", "secondary_actions", "sa", "click_to_call", "ctc", "directions", "dir",
+    "website", "web", "coupon", "cpn", "moreinfo", "info",
+    "video", "video_start", "video_first_quartile", "video_midpoint",
+    "video_third_quartile", "video_end", "vid_25", "vid_50", "vid_75", "vid_100",
+    "total_conversions", "conversions", "click_conversions", "view_conversions", "total_sales",
+}
+# Unique-people counts: windows overlap in audience, so the max is a lower bound.
+_MAX_FIELDS = {"cumulative_reach", "cumulative_visitors", "open_hour_cumulative_visitors"}
+# Rates and shares: impression-weighted average reproduces the exact combined value
+# (e.g. Σ(ctr·imp)/Σimp = Σclicks/Σimp in whatever scale the endpoint uses).
+_WEIGHTED_FIELDS = {
+    "ctr", "cpm", "sar", "svr", "vr", "vcr", "ltr", "svl", "avg_sales",
+    "mobile_imps", "tablet_imps", "tv_imps", "desktop_imps",
+}
+_KEEP_FIRST_FIELDS = {"latitude", "longitude"}
+_IDENTITY_NUMERIC_FIELDS = {"hr", "hour", "key", "sic"}
 
 
 class GroundTruthError(Exception):
@@ -70,7 +103,7 @@ def extract_rows(payload: Any) -> list[dict[str, Any]]:
 _METRIC_ALIASES = {
     "impressions": ("impressions", "imp"),
     "clicks": ("clicks", "clks"),
-    "spend": ("spend",),
+    "spend": ("spend", "spt"),
     "ctr": ("ctr", "click_through_rate"),
     "cpm": ("cpm",),
     "visits": ("visits", "vst"),
@@ -93,6 +126,74 @@ def metric(row: dict[str, Any], name: str) -> float:
     return 0.0
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_identity(key: str, value: Any) -> bool:
+    if key in _ADDITIVE_FIELDS or key in _MAX_FIELDS or key in _WEIGHTED_FIELDS:
+        return False
+    if key in _KEEP_FIRST_FIELDS:
+        return False
+    if not _is_number(value):
+        return True
+    return key in _IDENTITY_NUMERIC_FIELDS or key == "id" or key.endswith("_id")
+
+
+def merge_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Combine rows fetched for consecutive date windows into one row per entity
+    (campaign / ad group / creative / state / hour / date …).
+    """
+    groups: dict[tuple, list[dict[str, Any]]] = {}
+    for r in rows:
+        ident = tuple(sorted((k, str(v)) for k, v in r.items() if _is_identity(k, v)))
+        groups.setdefault(ident, []).append(r)
+
+    merged: list[dict[str, Any]] = []
+    for members in groups.values():
+        if len(members) == 1:
+            merged.append(members[0])
+            continue
+        out: dict[str, Any] = dict(members[0])
+        imps = [metric(m, "impressions") for m in members]
+        total_imps = sum(imps)
+        keys = {k for m in members for k in m}
+        for k in keys:
+            vals = [m.get(k) for m in members]
+            nums = [v for v in vals if _is_number(v)]
+            if not nums:
+                continue
+            if k in _MAX_FIELDS:
+                out[k] = max(nums)
+            elif k in _WEIGHTED_FIELDS:
+                if total_imps:
+                    out[k] = sum(
+                        _to_float(v) * w for v, w in zip(vals, imps) if _is_number(v)
+                    ) / total_imps
+            elif k in _KEEP_FIRST_FIELDS or _is_identity(k, nums[0]):
+                continue
+            else:
+                out[k] = sum(nums)
+        merged.append(out)
+    return merged
+
+
+def _parse_iso(value: str) -> Optional[date]:
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _api_message(data: Any) -> str:
+    if isinstance(data, dict):
+        for key in ("message", "error", "detail", "errors"):
+            if data.get(key):
+                return str(data[key])
+    return str(data or "")[:300]
+
+
 class GroundTruthClient:
     def __init__(self) -> None:
         self.user_id = _env("GROUND_TRUTH_USER_ID")
@@ -102,6 +203,10 @@ class GroundTruthClient:
         self.default_account = _env("GROUND_TRUTH_ACCOUNT_ID")
         self.base_url = (_env("GROUND_TRUTH_API_BASE") or DEFAULT_BASE_URL).rstrip("/")
         self.date_format = _env("GROUND_TRUTH_DATE_FORMAT") or "%Y-%m-%d"
+        try:
+            self.max_range_days = max(1, int(_env("GROUND_TRUTH_MAX_RANGE_DAYS") or DEFAULT_MAX_RANGE_DAYS))
+        except ValueError:
+            self.max_range_days = DEFAULT_MAX_RANGE_DAYS
         self._http = httpx.Client(
             timeout=httpx.Timeout(120.0, connect=15.0),
             http2=False,
@@ -133,13 +238,59 @@ class GroundTruthClient:
     def fmt_date(self, d: date) -> str:
         return d.strftime(self.date_format)
 
+    def _parse_param_date(self, value: Any) -> Optional[date]:
+        try:
+            return datetime.strptime(str(value), self.date_format).date()
+        except ValueError:
+            return _parse_iso(str(value))
+
+    def _windows(self, query: dict[str, Any]) -> Optional[list[tuple[date, date]]]:
+        """7-day windows covering start_date..end_date, or None if no split is needed."""
+        start = self._parse_param_date(query.get("start_date", ""))
+        end = self._parse_param_date(query.get("end_date", ""))
+        if not start or not end or end < start:
+            return None
+        if (end - start).days + 1 <= self.max_range_days:
+            return None
+        windows = []
+        cur = start
+        while cur <= end:
+            stop = min(cur + timedelta(days=self.max_range_days - 1), end)
+            windows.append((cur, stop))
+            cur = stop + timedelta(days=1)
+        if len(windows) > MAX_CHUNKS:
+            raise ValueError(
+                f"Date range {start}..{end} is too long ({len(windows)} × {self.max_range_days}-day "
+                f"requests). Use at most about a year."
+            )
+        return windows
+
     def get(self, path: str, params: Optional[dict[str, Any]] = None) -> Any:
-        """GET a Reporting API path with auth headers, retrying transient failures."""
+        """
+        GET a Reporting API path with auth headers, retrying transient failures.
+        Ranges longer than the API's 7-day limit are fetched in windows and merged
+        into a single row list.
+        """
         self.validate_config()
         clean = "/" + path.lstrip("/")
         if not clean.startswith("/demand/"):
             raise GroundTruthError("Only /demand/... Reporting API paths are allowed.")
         query = {k: v for k, v in (params or {}).items() if v is not None and v != ""}
+
+        windows = self._windows(query)
+        if not windows:
+            return self._get_once(clean, query)
+
+        def fetch(win: tuple[date, date]) -> list[dict[str, Any]]:
+            q = {**query, "start_date": self.fmt_date(win[0]), "end_date": self.fmt_date(win[1])}
+            return extract_rows(self._get_once(clean, q))
+
+        logger.info("GT %s split into %d windows of ≤%d days", clean, len(windows), self.max_range_days)
+        with ThreadPoolExecutor(max_workers=min(CHUNK_WORKERS, len(windows))) as pool:
+            parts = list(pool.map(fetch, windows))
+        return merge_rows([r for part in parts for r in part])
+
+    def _get_once(self, clean: str, query: dict[str, Any]) -> Any:
         headers = {"X-GT-USER-ID": self.user_id, "X-GT-API-KEY": self.api_key}
         url = f"{self.base_url}{clean}"
 
@@ -165,9 +316,15 @@ class GroundTruthClient:
                 data = res.text
 
             if res.status_code in (401, 403):
+                msg = _api_message(data)
+                # GroundTruth answers 401 for request-validation problems too
+                # (e.g. the 7-day range limit), so only blame credentials when
+                # the API doesn't say otherwise.
+                if msg and "date range" in msg.lower():
+                    raise GroundTruthError(f"GroundTruth rejected the date range: {msg}")
                 raise GroundTruthError(
-                    f"GroundTruth auth failed (HTTP {res.status_code}). Check "
-                    "GROUND_TRUTH_USER_ID / GROUND_TRUTH_API_KEY and that this user "
+                    f"GroundTruth denied access (HTTP {res.status_code}): {msg or 'no details'}. "
+                    "Check GROUND_TRUTH_USER_ID / GROUND_TRUTH_API_KEY and that this user "
                     "has access to the requested org/account/campaign."
                 )
             if not res.is_success:
@@ -272,13 +429,20 @@ class GroundTruthClient:
             raise ValueError(
                 "Pass a numeric campaign id, or set GROUND_TRUTH_ORG_ID so names can be looked up."
             )
+        # Walk back one API-sized window at a time and stop at the first hit,
+        # instead of paying for ~50 requests to cover a whole year.
         end = date.today()
-        start = end - timedelta(days=365)
-        rows = self.list_campaigns(start, end, account_id=account_id, search=q)
-        if not rows:
-            raise ValueError(f"No campaign matching '{q}' in the last 12 months.")
-        exact = [r for r in rows if str(r.get("campaign_name") or "").lower() == q.lower()]
-        return str((exact or rows)[0]["campaign_id"])
+        for _ in range(NAME_LOOKUP_WEEKS):
+            start = end - timedelta(days=self.max_range_days - 1)
+            rows = self.list_campaigns(start, end, account_id=account_id, search=q)
+            if rows:
+                exact = [r for r in rows if str(r.get("campaign_name") or "").lower() == q.lower()]
+                return str((exact or rows)[0]["campaign_id"])
+            end = start - timedelta(days=1)
+        raise ValueError(
+            f"No campaign matching '{q}' with delivery in the last "
+            f"{NAME_LOOKUP_WEEKS * self.max_range_days} days. Pass the numeric campaign id instead."
+        )
 
     # ------------------------------------------------------------------
     # Reports

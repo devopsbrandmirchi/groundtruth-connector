@@ -284,7 +284,17 @@ def _parse_date(value: str, *, default: Optional[date] = None) -> date:
     return datetime.strptime(raw[:10], "%Y-%m-%d").date()
 
 
+def _is_relative_preset(value: str) -> bool:
+    lowered = (value or "").strip().lower()
+    return lowered.startswith("last_") and lowered.endswith("_days")
+
+
 def _date_range(start_date: str, end_date: str = "") -> tuple[date, date]:
+    if _is_relative_preset(start_date) and not (end_date or "").strip():
+        # last_N_days → the N full days ending yesterday.
+        end = date.today() - timedelta(days=1)
+        days = int(start_date.strip().lower()[5:-5])
+        return end - timedelta(days=max(days, 1) - 1), end
     start = _parse_date(start_date)
     end = _parse_date(end_date, default=start)
     if end < start:
@@ -457,7 +467,10 @@ CONVERSIONS
 - "Conversion tracking for account 12345 last week"
 
 Dates are YYYY-MM-DD, or today / yesterday / last_7_days / last_30_days.
-Campaign can be a numeric id or a name (names need GROUND_TRUTH_ORG_ID).
+Any range works: the API caps each request at 7 days, so longer ranges are
+fetched week by week and combined automatically.
+Campaign can be a numeric id or a name (names need GROUND_TRUTH_ORG_ID and
+recent delivery; use the numeric id for older campaigns).
 GroundTruth metrics: visits = attributed store visits, secondary actions =
 click-to-call / directions / website / more-info / coupon."""
 
@@ -643,7 +656,11 @@ def get_campaign_summary(campaign: str, start_date: str = "", end_date: str = ""
         f"Dates: {_span(start, end)}",
         f"Spend: {_fmt_money(t['spend'])}",
         f"Impressions: {_fmt_int(t['impressions'])}",
-        f"Reach: {_fmt_int(t['reach'])}",
+        (
+            f"Reach: at least {_fmt_int(t['reach'])} (largest single {_gt().max_range_days}-day window)"
+            if (end - start).days + 1 > _gt().max_range_days
+            else f"Reach: {_fmt_int(t['reach'])}"
+        ),
         f"Clicks: {_fmt_int(t['clicks'])}",
         f"Visits: {_fmt_int(t['visits'])} (projected {_fmt_int(t['projected_visits'])})",
         f"Secondary actions: {_fmt_int(t['secondary_actions'])}",
